@@ -16,7 +16,16 @@ from backend.repositories import MCPServerRepository, ToolRepository
 from backend.schemas.requests import CreateMCPServerRequest
 from backend.services.mcp_connection_manager import MCPConnectionManager
 from backend.services.sandbox import available_local_servers, server_names
+from backend.services.tool_foundry.registry_adapter import GENERATED_SERVER, describe, discover
 from backend.utils.jsonc import loads as jsonc_loads
+
+# Servers the runtime owns. They cannot be created, renamed or removed through
+# the operator API, only enabled and disabled.
+_IN_PROCESS_TRANSPORTS = frozenset({"local", "generated"})
+
+
+def reserved_server_names() -> set[str]:
+    return set(server_names()) | {GENERATED_SERVER}
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _STORED = "<stored; unchanged>"
@@ -85,6 +94,44 @@ class ToolRegistry:
                     server.url = f"local://{name}"
                 discovered = self.connection_manager.local_tools(server)
                 tools.reconcile(server.id, discovered, default_enabled=False)
+        self.sync_generated()
+
+    def sync_generated(self) -> tuple[int, int, int]:
+        """Reconcile the `generated` server's tools with what is installed.
+
+        Called at boot and after an install or a removal, so the catalogue
+        follows the store. New tools arrive disabled; an existing tool keeps its
+        enable and approval flags unless its schema changed, in which case the
+        repository revokes the approval.
+        """
+        with self._writes, self.db.session() as session:
+            servers = MCPServerRepository(session)
+            tools = ToolRepository(session)
+            server = servers.get_by_name(GENERATED_SERVER)
+            if server is None:
+                server = servers.create(
+                    name=GENERATED_SERVER,
+                    transport="generated",
+                    enabled=True,
+                    trusted=True,
+                    timeout_ms=60_000,
+                )
+            else:
+                server.transport = "generated"
+            return tools.reconcile(server.id, discover(self.settings), default_enabled=False)
+
+    def generated_capabilities(self) -> list[dict]:
+        """Installed capabilities with the evidence the review view needs."""
+        capabilities = describe(self.settings)
+        with self.db.session() as session:
+            tools = ToolRepository(session)
+            for entry in capabilities:
+                row = tools.get_by_namespaced(entry["tool"])
+                entry["enabled"] = bool(row.enabled) if row else False
+                entry["approved"] = bool(row.approved) if row else False
+                entry["risk"] = row.risk if row else "high"
+                entry["tool_id"] = row.id if row else None
+        return capabilities
 
     # -- servers --------------------------------------------------------------
 
@@ -149,8 +196,10 @@ class ToolRegistry:
             fields = ", ".join(".".join(map(str, e["loc"])) for e in exc.errors())
             raise RegistryError(f"invalid config fields: {fields}") from exc
         validate_server_name(body.name)
-        if body.name in server_names() or body.transport == "local":
-            raise RegistryError("built-in server names and local transport are reserved")
+        if body.name in reserved_server_names() or body.transport in _IN_PROCESS_TRANSPORTS:
+            raise RegistryError(
+                "runtime-owned server names and in-process transports are reserved"
+            )
         if not body.verify_ssl:
             raise RegistryError("TLS verification cannot be disabled")
         if body.transport == "stdio":
@@ -207,7 +256,7 @@ class ToolRegistry:
             server = repo.get(server_id)
             if server is None:
                 return None
-            if server.transport == "local":
+            if server.transport in _IN_PROCESS_TRANSPORTS:
                 if set(fields) - {"enabled"}:
                     raise RegistryError(
                         "in-process (local) servers support enable/disable only"
@@ -226,8 +275,8 @@ class ToolRegistry:
         with self._writes, self.db.session() as session:
             repo = MCPServerRepository(session)
             server = repo.get(server_id)
-            if server and server.name in server_names():
-                raise RegistryError("built-in servers can be disabled, not removed")
+            if server and server.name in reserved_server_names():
+                raise RegistryError("runtime-owned servers can be disabled, not removed")
             return repo.delete(server_id)
 
     # -- tools ----------------------------------------------------------------
@@ -281,8 +330,8 @@ class ToolRegistry:
         servers = {}
         redacted = False
         for server in self.list_servers():
-            if server.transport == "local":
-                continue
+            if server.transport in _IN_PROCESS_TRANSPORTS:
+                continue  # not an operator-editable connection
             values = self._values(server)
             spec = {"type": values["transport"], "timeout_ms": values["timeout_ms"]}
             if server.transport == "stdio":
@@ -383,7 +432,10 @@ class ToolRegistry:
             removed = 0
             if sync:
                 for server in repo.list():
-                    if server.name not in servers and server.transport != "local":
+                    if (
+                        server.name not in servers
+                        and server.transport not in _IN_PROCESS_TRANSPORTS
+                    ):
                         repo.delete(server.id)
                         removed += 1
         return {"results": results, "applied": True, "removed": removed}

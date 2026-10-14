@@ -5,10 +5,10 @@ from fastapi.testclient import TestClient
 from backend.tests.helpers import demo_server, enable_demo_add, sandbox_server
 
 
-def test_seed_ships_only_sandbox(make_app):
-    """A normal installation ships the sandbox server and nothing else."""
+def test_seed_ships_only_runtime_owned_servers(make_app):
+    """A normal installation ships the sandbox and the generated-tool host."""
     with TestClient(make_app(toolloom_seed_demo=False), base_url="http://127.0.0.1:8000") as client:
-        assert [s["name"] for s in client.get("/mcp/servers").json()] == ["sandbox"]
+        assert [s["name"] for s in client.get("/mcp/servers").json()] == ["generated", "sandbox"]
 
 
 def test_seed_creates_demo_server_with_disabled_tools(client):
@@ -147,5 +147,5 @@ def test_builtin_disable_survives_restart(make_app):
 
         with TestClient(build(), base_url="http://127.0.0.1:8000") as second:
             names = sorted(s["name"] for s in second.get("/mcp/servers").json())
-            assert names == ["sandbox"]
+            assert names == ["generated", "sandbox"]
             assert sandbox_server(second)["enabled"] is False

@@ -67,12 +67,20 @@ def validate_arguments(schema: dict[str, Any], arguments: dict[str, Any]) -> lis
 
 class ToolExecutor:
     def __init__(
-        self, db, settings, connection_manager: MCPConnectionManager, secret_resolver=None
+        self,
+        db,
+        settings,
+        connection_manager: MCPConnectionManager,
+        secret_resolver=None,
+        registry=None,
     ) -> None:
         self.db = db
         self.settings = settings
         self.connection_manager = connection_manager
         self.secret_resolver = secret_resolver
+        # Handed to tools that change the catalogue themselves, such as
+        # installing a generated capability.
+        self.registry = registry
 
     async def execute(self, call, conversation_id: str) -> ExecutionResult:
         started = time.perf_counter()
@@ -217,6 +225,7 @@ class ToolExecutor:
             skills=skills,
             secrets=self.secret_resolver,
             settings=self.settings,
+            registry=self.registry,
         )
 
     def _spill(self, conversation_id: str, result: ExecutionResult) -> None:

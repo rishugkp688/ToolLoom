@@ -22,7 +22,9 @@ class SendMessageRequest(BaseModel):
 class CreateMCPServerRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=64)
-    transport: str = Field(default="http", pattern="^(http|sse|local|stdio)$")
+    # `local` and `generated` are runtime-owned; the registry rejects those with a
+    # clearer message than a pattern failure would give.
+    transport: str = Field(default="http", pattern="^(http|sse|local|stdio|generated)$")
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
     enabled: bool = False

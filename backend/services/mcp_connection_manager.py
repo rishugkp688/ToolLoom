@@ -1,7 +1,10 @@
 """Transport dispatch for MCP servers.
 
-Supports the in-process ``local`` transport and remote ``http`` (Streamable HTTP)
-/ ``sse`` (legacy) transports. ``stdio`` is operator-managed and opt-in.
+Supports the in-process ``local`` transport (the built-in sandbox), the
+in-process ``generated`` transport (installed Tool Foundry capabilities), remote
+``http`` (Streamable HTTP) and ``sse`` (legacy) transports, and operator-managed
+``stdio``. All of them present the same capability model: discovery through the
+registry, namespaced tool names, schema validation and one executor.
 """
 
 from __future__ import annotations
@@ -18,6 +21,22 @@ from backend.services.sandbox import dispatch as sandbox_dispatch
 from backend.services.sandbox import tools_for as sandbox_tools_for
 
 __all__ = ["MCPConnectionManager", "MCPError", "ToolCallOutcome"]
+
+
+def _async_local_handler(server_name: str, tool_name: str):
+    """Local tools that must run on the event loop because they spawn children.
+
+    The rest of the local tools are synchronous and run in a worker thread.
+    """
+    if server_name != "sandbox":
+        return None
+    if tool_name == "python":
+        from backend.services.sandbox.python_tool import execute
+
+        return execute
+    from backend.services.sandbox.foundry_tools import ASYNC_HANDLERS
+
+    return ASYNC_HANDLERS.get((server_name, tool_name))
 
 
 class MCPConnectionManager:
@@ -68,6 +87,10 @@ class MCPConnectionManager:
         transport = getattr(server, "transport", "http")
         if transport == "local":
             return self.local_tools(server)
+        if transport == "generated":
+            from backend.services.tool_foundry import registry_adapter
+
+            return registry_adapter.discover(self.settings)
         if transport in {"http", "sse", "stdio"}:
             if transport in {"http", "sse"} and not server.url:
                 raise MCPError(f"server {server.name!r} has no url")
@@ -102,14 +125,18 @@ class MCPConnectionManager:
     ) -> ToolCallOutcome:
         transport = getattr(server, "transport", "http")
         if transport == "local":
-            if server.name == "sandbox" and tool_name == "python":
-                from backend.services.sandbox.python_tool import execute
-                return await execute(arguments, ctx, self.settings)
+            handler = _async_local_handler(server.name, tool_name)
+            if handler is not None:
+                return await handler(arguments, ctx, self.settings)
             # Local handlers may do blocking I/O (e.g. http_fetch); keep the loop free.
             text = await asyncio.to_thread(
                 sandbox_dispatch, server.name, tool_name, arguments, ctx
             )
             return ToolCallOutcome(text=text, is_error=False)
+        if transport == "generated":
+            from backend.services.tool_foundry import registry_adapter
+
+            return await registry_adapter.call(self.settings, tool_name, arguments, ctx)
         if transport in {"http", "sse", "stdio"}:
             if transport in {"http", "sse"} and not server.url:
                 raise MCPError(f"server {server.name!r} has no url")

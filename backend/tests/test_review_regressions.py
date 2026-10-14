@@ -187,7 +187,11 @@ def test_failed_sync_import_is_atomic(client):
 def test_invalid_import_does_not_mutate(client, spec):
     result = client.post("/mcp/servers/import", json={"mcpServers": {"bad": spec}}).json()
     assert result["applied"] is False
-    assert [s["name"] for s in client.get("/mcp/servers").json()] == ["demo", "sandbox"]
+    assert [s["name"] for s in client.get("/mcp/servers").json()] == [
+        "demo",
+        "generated",
+        "sandbox",
+    ]
 
 
 def test_config_view_masks_credentials_and_roundtrips(client):

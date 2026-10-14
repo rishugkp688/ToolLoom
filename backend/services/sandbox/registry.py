@@ -21,9 +21,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from backend.services.sandbox import fs_tool, http_tool, search_tool
+from pydantic import ValidationError
+
+from backend.services.sandbox import foundry_tools, fs_tool, http_tool, search_tool
 from backend.services.sandbox.workspace import Workspace, workspace_for
 from backend.services.skills import read_skill_body
+from backend.services.tool_foundry import authoring
+from backend.services.tool_foundry.manifest import FoundryError
 
 
 class SandboxError(RuntimeError):
@@ -40,6 +44,9 @@ class ToolContext:
     # Read-only view of the operator's Settings for tools that need limits or
     # provider choices. Never contains credentials.
     settings: Any = None
+    # The tool registry, for the rare tool that changes the catalogue: installing
+    # a generated capability must make it visible without a restart.
+    registry: Any = None
 
     def workspace(self) -> Workspace:
         return workspace_for(self.workspaces_dir, self.conversation_id)
@@ -99,6 +106,27 @@ def _http_fetch(arguments: dict[str, Any], ctx: ToolContext) -> str:
 
 def _web_search(arguments: dict[str, Any], ctx: ToolContext) -> str:
     return search_tool.search(arguments, ctx)
+
+
+# --- tool foundry ------------------------------------------------------------
+
+def _foundry_scaffold(arguments: dict[str, Any], ctx: ToolContext) -> str:
+    if not getattr(ctx.settings, "toolloom_allow_foundry", False):
+        raise SandboxError(foundry_tools.DISABLED_MESSAGE)
+    name = str(arguments.get("name") or "").strip()
+    description = str(arguments.get("description") or "").strip()
+    schema = arguments.get("input_schema")
+    if not isinstance(schema, dict):
+        raise SandboxError("`input_schema` must be a JSON object")
+    try:
+        result = authoring.scaffold_package(ctx.workspace(), name, description, schema)
+    except (FoundryError, ValidationError) as exc:
+        raise SandboxError(str(exc)) from exc
+    return json.dumps(result, indent=2, sort_keys=True)
+
+
+def _foundry_async_only(arguments: dict[str, Any], ctx: ToolContext) -> str:
+    raise SandboxError("Tool Foundry validation and installation need the async dispatcher")
 
 
 def _python_async_only(arguments: dict[str, Any], ctx: ToolContext) -> str:
@@ -284,6 +312,60 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
                 "additionalProperties": False,
             },
             handler=_web_search,
+            risk="high",
+        ),
+        SandboxTool(
+            name="foundry_scaffold",
+            description=(
+                "Start a reusable capability from a script you have been running. Writes a "
+                "package under foundry/<name>/ with manifest.json, a CLI skeleton whose flags "
+                "match the schema you pass, and a test file. Fill in the logic, then call "
+                "foundry_validate, then foundry_install. Requires TOOLLOOM_ALLOW_FOUNDRY=1."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]{1,47}$"},
+                    "description": {"type": "string", "maxLength": 500},
+                    "input_schema": {
+                        "type": "object",
+                        "description": "JSON Schema for the tool's arguments, type object",
+                    },
+                },
+                "required": ["name", "description", "input_schema"],
+                "additionalProperties": False,
+            },
+            handler=_foundry_scaffold,
+        ),
+        SandboxTool(
+            name="foundry_validate",
+            description=(
+                "Run a package's tests and check its structure without installing anything. "
+                "Executes generated code, so it needs operator opt-in and approval."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+            handler=_foundry_async_only,
+            risk="high",
+        ),
+        SandboxTool(
+            name="foundry_install",
+            description=(
+                "Validate a package and install it as a reusable capability. The tool is "
+                "registered disabled and unapproved; the operator enables it in Settings -> "
+                "Capabilities. Executes generated code, so it needs opt-in and approval."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+            handler=_foundry_async_only,
             risk="high",
         ),
     ],

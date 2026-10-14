@@ -29,6 +29,7 @@
         <nav class="workspace-nav" aria-label="Workspace">
           <button class="nav-link" type="button" data-settings-tab="mcp"><span data-icon="tools"></span>Tools & connections<span class="nav-arrow">↗</span></button>
           <button class="nav-link" type="button" data-settings-tab="skills"><span data-icon="layers"></span>Skills<span class="nav-arrow">↗</span></button>
+          <button class="nav-link" type="button" data-settings-tab="capabilities"><span data-icon="spark"></span>Capabilities<span class="nav-arrow">↗</span></button>
         </nav>
         <div class="section-label">Your sessions<span id="sessionCount">0</span></div>
         <nav class="sessions" id="sessionList" aria-label="Session list"></nav>
@@ -140,6 +141,7 @@
       <nav class="tabs" id="panelTabs" role="tablist" aria-label="Settings sections">
         <button class="tab" id="tab-mcp" role="tab" aria-selected="true" aria-controls="panel-mcp" data-tab="mcp" type="button">MCP</button>
         <button class="tab" id="tab-skills" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-skills" data-tab="skills" type="button">Skills</button>
+        <button class="tab" id="tab-capabilities" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-capabilities" data-tab="capabilities" type="button">Capabilities</button>
         <button class="tab" id="tab-secrets" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-secrets" data-tab="secrets" type="button">Secrets</button>
         <button class="tab" id="tab-prompt" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-prompt" data-tab="prompt" type="button">Prompt</button>
       </nav>
@@ -188,6 +190,13 @@
           <div>
             <div class="group-head">Installed</div>
             <div class="rows" id="skillList"></div>
+          </div>
+        </section>
+
+        <section class="group" id="panel-capabilities" role="tabpanel" aria-labelledby="tab-capabilities" data-panel="capabilities" hidden>
+          <div>
+            <div class="group-head">Installed capabilities</div>
+            <div class="rows" id="capabilityList"></div>
           </div>
         </section>
 

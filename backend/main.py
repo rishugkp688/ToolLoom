@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.api import (
+    capabilities,
     conversations,
     health,
     mcp_servers,
@@ -114,7 +115,9 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
     connection_manager = MCPConnectionManager(settings, secret_resolver=secret_resolver)
     tool_registry = ToolRegistry(db, settings, connection_manager)
     tool_registry.seed()
-    tool_executor = ToolExecutor(db, settings, connection_manager, secret_resolver=secret_resolver)
+    tool_executor = ToolExecutor(
+        db, settings, connection_manager, secret_resolver=secret_resolver, registry=tool_registry
+    )
 
     skill_service = SkillService(db, settings)
     skill_service.seed()
@@ -170,6 +173,7 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
     app.include_router(secrets_api.router)
     app.include_router(skills_api.router)
     app.include_router(settings_api.router)
+    app.include_router(capabilities.router)
 
     if FRONTEND_DIR.exists():
         app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

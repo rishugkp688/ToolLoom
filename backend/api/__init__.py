@@ -1,6 +1,7 @@
 """FastAPI routers."""
 
 from backend.api import (
+    capabilities,
     conversations,
     health,
     mcp_servers,
@@ -11,6 +12,7 @@ from backend.api import (
 )
 
 __all__ = [
+    "capabilities",
     "conversations",
     "health",
     "mcp_servers",
@@ -19,4 +21,3 @@ __all__ = [
     "settings",
     "skills",
 ]
-

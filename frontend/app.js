@@ -50,6 +50,9 @@ const ICON_PATHS = {
   message: '<path d="M20 15a3 3 0 0 1-3 3H9l-5 3V6a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v9Z"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1 1M18 18l1 1M5 19l1-1M18 6l1-1"/>',
   moon: '<path d="M20 14A8 8 0 0 1 10 4a8 8 0 1 0 10 10Z"/>',
+  spark: '<path d="M12 3v5M12 16v5M4.5 12h5M14.5 12h5M7 7l3 3M14 14l3 3M17 7l-3 3M10 14l-3 3"/>',
+  check: '<path d="m5 13 4 4L19 7"/>',
+  code: '<path d="m9 8-5 4 5 4M15 8l5 4-5 4"/>',
 };
 function icon(name) {
   return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name] || ""}</svg>`;
@@ -240,6 +243,17 @@ async function confirmDeleteSession() {
   const pending = state.pendingDelete;
   if (!pending || pending.busy) return;
   const { id } = pending;
+  // One dialog serves chats, MCP servers and installed capabilities.
+  const target =
+    pending.kind === "server"
+      ? { url: `/mcp/servers/${id}`, noun: "this server", label: "Remove server" }
+      : pending.kind === "capability"
+        ? {
+            url: `/capabilities/${encodeURIComponent(id)}`,
+            noun: "this capability",
+            label: "Remove capability",
+          }
+        : { url: `/conversations/${id}`, noun: "this chat", label: "Delete chat" };
   $("deleteError").hidden = true;
   if (pending.kind === "chat" && state.running && state.currentId === id) {
     $("deleteError").textContent = "Stop the current run before deleting this chat.";
@@ -252,9 +266,9 @@ async function confirmDeleteSession() {
   $("confirmDeleteBtn").disabled = true;
   $("confirmDeleteBtn").textContent = "Deleting…";
   try {
-    await api(pending.kind === "server" ? `/mcp/servers/${id}` : `/conversations/${id}`, { method: "DELETE" });
+    await api(target.url, { method: "DELETE" });
   } catch (err) {
-    $("deleteError").textContent = `Couldn’t delete ${pending.kind === "server" ? "this server" : "this chat"}. ${err.message}`;
+    $("deleteError").textContent = `Couldn’t delete ${target.noun}. ${err.message}`;
     $("deleteError").hidden = false;
     return;
   } finally {
@@ -262,13 +276,19 @@ async function confirmDeleteSession() {
     $("deleteDialog").removeAttribute("aria-busy");
     $("cancelDeleteBtn").disabled = false;
     $("confirmDeleteBtn").disabled = false;
-    $("confirmDeleteBtn").textContent = pending.kind === "server" ? "Remove server" : "Delete chat";
+    $("confirmDeleteBtn").textContent = target.label;
   }
   if (pending.kind === "server") {
     state.toolsDirty = true;
     closeDeleteDialog();
     await Promise.all([renderServers(), refreshInspector(), loadCurrentConfig(false)]);
     toast("Server removed.");
+    return;
+  }
+  if (pending.kind === "capability") {
+    closeDeleteDialog();
+    await Promise.all([renderCapabilities(), refreshInspector()]);
+    toast("Capability removed.");
     return;
   }
   if (state.currentId === id) {
@@ -1014,6 +1034,7 @@ async function refreshPanel() {
   const tab = currentTab();
   if (tab === "mcp") await Promise.all([renderServers(), loadCurrentConfig(false)]);
   else if (tab === "skills") await renderSkills();
+  else if (tab === "capabilities") await renderCapabilities();
   else if (tab === "secrets") await renderSecrets();
   else if (tab === "prompt") await renderPrompt();
 }
@@ -1243,6 +1264,200 @@ async function renderSkills() {
     card.append(head, desc);
     host.appendChild(card);
   }
+}
+
+async function renderCapabilities() {
+  const host = $("capabilityList");
+  showLoading(host, "Reading capabilities…");
+  let payload;
+  try {
+    payload = await api("/capabilities");
+  } catch (err) {
+    clearLoading(host);
+    host.innerHTML = `<p class="hint">Couldn’t read capabilities. ${escapeHtml(err.message)}</p>`;
+    return;
+  }
+  clearLoading(host);
+  host.innerHTML = "";
+
+  const capabilities = payload.capabilities || [];
+  const note = document.createElement("p");
+  note.className = "hint";
+  if (!payload.foundry_enabled) {
+    note.textContent =
+      "Tool Foundry is off. Set TOOLLOOM_ALLOW_FOUNDRY=1 in .env and restart before the agent can build a capability.";
+  } else if (!capabilities.length) {
+    note.textContent =
+      "Nothing installed yet. When a script gets reused across sessions, ask the agent to turn it into a capability and install it.";
+  } else {
+    note.textContent =
+      "Built by the agent from a script you asked it to reuse. Review the source, then enable and approve it.";
+  }
+  host.appendChild(note);
+  if (!capabilities.length) return;
+
+  for (const item of capabilities) {
+    host.appendChild(capabilityCard(item, payload.server_id));
+  }
+}
+
+async function setCapabilityFlag(serverId, name, fields) {
+  if (!serverId) throw new Error("the generated-tool server is missing; restart the backend");
+  await api(`/mcp/servers/${serverId}/tools/${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    body: JSON.stringify(fields),
+  });
+  state.toolsDirty = true;
+  await refreshInspector();
+}
+
+function _switchControl(id, checked, onChange) {
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.className = "toggle-control";
+  box.setAttribute("role", "switch");
+  box.id = id;
+  box.checked = checked;
+  box.addEventListener("change", () => {
+    onChange(box).catch(async (err) => {
+      toast(err.message, "error");
+      box.checked = !box.checked;
+      await renderCapabilities();
+    });
+  });
+  return box;
+}
+
+function capabilityCard(item, serverId) {
+  const card = document.createElement("div");
+  card.className = "card";
+
+  const head = document.createElement("div");
+  head.className = "card-head";
+
+  const toggleId = `cap-${item.name}`;
+  const toggle = _switchControl(toggleId, item.enabled, (box) =>
+    setCapabilityFlag(serverId, item.name, { enabled: box.checked })
+  );
+  const label = document.createElement("label");
+  label.className = "check";
+  label.htmlFor = toggleId;
+  label.innerHTML = `<strong>${escapeHtml(item.name)}</strong><span class="tag">${escapeHtml(item.version)}</span>`;
+
+  const risk = document.createElement("span");
+  risk.className = "tag";
+  risk.dataset.risk = item.risk;
+  risk.textContent = item.risk;
+
+  head.append(toggle, label, risk);
+
+  if (item.risk === "high") {
+    const approveId = `${toggleId}-approve`;
+    const approve = _switchControl(approveId, item.approved, (box) =>
+      setCapabilityFlag(serverId, item.name, { approved: box.checked })
+    );
+    const approveLabel = document.createElement("label");
+    approveLabel.className = "check";
+    approveLabel.htmlFor = approveId;
+    approveLabel.textContent = "Approved";
+    head.append(approve, approveLabel);
+  }
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "btn btn-quiet btn-icon";
+  remove.setAttribute("aria-label", `Remove capability ${item.name}`);
+  remove.innerHTML = icon("close");
+  remove.addEventListener("click", () =>
+    deleteCapability(item.name, `${item.name} ${item.version}`)
+  );
+  head.appendChild(remove);
+
+  const desc = document.createElement("p");
+  desc.className = "hint";
+  desc.style.marginTop = "var(--s2)";
+  desc.textContent = item.description;
+
+  const meta = document.createElement("p");
+  meta.className = "hint";
+  meta.textContent = [
+    `${item.tests_passed ?? 0} test(s) passed at install`,
+    `entrypoint ${item.entrypoint}`,
+    `sha256 ${String(item.sha256 || "").slice(0, 12)}`,
+  ].join(" · ");
+
+  card.append(head, desc, meta);
+
+  if (!item.integrity_ok) {
+    const warn = document.createElement("p");
+    warn.className = "hint";
+    warn.textContent =
+      "This file changed after it was approved. It will refuse to run until you reinstall it.";
+    card.appendChild(warn);
+  }
+
+  if (item.source_conversation) {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "btn btn-quiet";
+    open.textContent = "Where it came from";
+    open.addEventListener("click", () => {
+      const id = item.source_conversation;
+      closeSettings();
+      openSession(id).catch((err) => toast(err.message, "error"));
+    });
+    card.appendChild(open);
+  }
+
+  const details = document.createElement("details");
+  details.className = "config-panel";
+  const summary = document.createElement("summary");
+  summary.textContent = "Source and tests";
+  const body = document.createElement("div");
+  body.className = "rows";
+  let loaded = false;
+  details.addEventListener("toggle", () => {
+    if (!details.open || loaded) return;
+    loaded = true;
+    body.innerHTML = '<p class="hint">Reading source…</p>';
+    api(`/capabilities/${encodeURIComponent(item.name)}/source`)
+      .then((payload) => {
+        body.innerHTML = "";
+        for (const [name, text] of Object.entries(payload.files || {})) {
+          const pre = document.createElement("pre");
+          pre.className = "entry-pre";
+          pre.textContent = `// ${name}\n${text}`;
+          body.appendChild(pre);
+        }
+        if (!body.childElementCount) body.innerHTML = '<p class="hint">No readable files.</p>';
+      })
+      .catch((err) => {
+        body.innerHTML = `<p class="hint">Couldn’t read the source. ${escapeHtml(err.message)}</p>`;
+      });
+  });
+  details.append(summary, body);
+  card.appendChild(details);
+
+  return card;
+}
+
+function deleteCapability(name, label) {
+  if (state.pendingDelete) return;
+  state.pendingDelete = {
+    id: name,
+    kind: "capability",
+    opener: document.activeElement,
+    busy: false,
+  };
+  $("deleteTitle").textContent = "Remove this capability?";
+  $("deleteDescription").textContent =
+    "The installed package and its tests are deleted. The source stays in the conversation that created it. This can’t be undone.";
+  $("confirmDeleteBtn").textContent = "Remove capability";
+  $("deleteSessionName").textContent = label;
+  $("deleteError").hidden = true;
+  $("deleteError").textContent = "";
+  $("deleteDialog").showModal();
+  $("cancelDeleteBtn").focus();
 }
 
 async function renderSecrets() {

@@ -75,10 +75,10 @@ Dependencies point one way: `api -> runtime/services -> repositories -> models`.
              |                 ToolRegistry (services/)
              |                        |
              |                 MCPConnectionManager (services/)
-             |                   |            |            |
-             |                   v            v            v
-             |            local sandbox   Streamable    legacy SSE   stdio
-             |            (in-process)      HTTP        (opt-in)      (opt-in)
+             |                   |            |            |          |
+             |                   v            v            v          v
+             |            local sandbox   generated   Streamable  legacy SSE  stdio
+             |            (in-process)  (in-process)     HTTP     (opt-in)    (opt-in)
              v
      SQLite (SQLAlchemy 2)  +  per-conversation workspace files
 ```
@@ -100,7 +100,8 @@ Key modules:
 | Tools | `backend/services/tool_executor.py` | Authorization, validation, dispatch, retry |
 | Tools | `backend/services/mcp_connection_manager.py` | Transport dispatch |
 | Tools | `backend/services/mcp_client.py` | MCP SDK wrapper for HTTP, SSE and stdio |
-| Sandbox | `backend/services/sandbox/*` | In-process tools and workspace rules |
+| Sandbox | `backend/services/sandbox/*` | In-process tools, shared subprocess policy, workspace rules |
+| Foundry | `backend/services/tool_foundry/*` | Capability manifests, validation, install store, execution |
 | Providers | `backend/services/providers/*` | Normalized contract plus adapters |
 | Secrets | `backend/services/secrets.py` | Fernet vault and `${secrets.NAME}` substitution |
 
@@ -228,14 +229,23 @@ grep. The complete text still reaches the UI. Nothing is quietly dropped.
 
 ## 8. MCP integration
 
-Four transports, one capability model:
+Five transports, one capability model:
 
 | Transport | Path | Notes |
 | --- | --- | --- |
 | `local` | In-process | The built-in sandbox. Cannot be created or edited by an operator, or by the model |
+| `generated` | In-process | Installed Tool Foundry capabilities. Also runtime-owned |
 | `http` | Streamable HTTP | Default for remote servers |
 | `sse` | Legacy HTTP+SSE | Kept for servers that only offer it |
 | `stdio` | Fixed local command | Operator-only, requires `TOOLLOOM_ALLOW_STDIO=1` |
+
+`local` and `generated` are in-process adapters rather than MCP sessions. Discovery
+reads a Python dict, or the installed manifests, instead of making a `tools/list`
+round trip; dispatch calls the handler directly instead of `tools/call`. There is
+no JSON-RPC, no `initialize` handshake and no session for either. They are
+registered as servers anyway, because that is what gives them the same catalogue,
+schema validation, enable flag, risk level and approval gate as a remote server —
+one model to reason about, one executor to audit.
 
 Servers are stored in SQLite, not in a watched file. You paste a config in
 Settings, or import one, and ToolLoom reconciles it:
@@ -245,7 +255,8 @@ Settings, or import one, and ToolLoom reconciles it:
 - A schema change revokes the previous approval for that tool.
 - Discovery adds, updates and removes tool rows, and always preserves the enable
   flag on rows that already exist.
-- Sync removal deletes omitted custom servers, never in-process ones.
+- Sync removal deletes omitted custom servers, never in-process ones (`local` and
+  `generated` are both exempt).
 - Exports mask literal headers, environment values and credential-bearing query
   strings as `<stored; unchanged>`, which round-trips safely in this installation
   and is deliberately not portable to another one.
@@ -262,6 +273,8 @@ and every one of its tools starts disabled.
 | `web_search` | high | Keyless search: DuckDuckGo, Wikipedia, or your own SearXNG |
 | `python` | high | Run Python in the workspace. Not OS-isolated |
 | `skill_list`, `skill_read` | low | Read installed skills |
+| `foundry_scaffold` | low | Write a capability package skeleton |
+| `foundry_validate`, `foundry_install` | high | Run generated tests, then install |
 
 **Workspace path rules.** Every path resolves through `Workspace.resolve`, which
 rejects absolute paths, drive letters, UNC paths, `~`, NUL bytes, and anything
@@ -286,7 +299,96 @@ of silently returning nothing.
 as the working directory and a minimal environment. 15-second default timeout and
 a 64,000-byte combined output cap, both configurable.
 
-## 10. Data model
+## 10. Tool Foundry
+
+Turns a script the operator keeps rewriting into an installed capability that any
+later conversation can call. The agent never starts this on its own; it runs when
+asked. Stage 4 of the original plan — the agent noticing a repetition and
+*proposing* a capability — is deliberately not built, because there is no evidence
+yet that suggestions would be welcome.
+
+### 10.1 Three steps, kept separate
+
+1. **`foundry_scaffold`** writes `<workspace>/foundry/<name>/` containing
+   `manifest.json`, a CLI skeleton whose `argparse` flags are generated from the
+   declared schema (underscores become hyphens), and a unittest file. Existing
+   files are never overwritten, so calling it twice is safe.
+2. **`foundry_validate`** checks the manifest, that the entrypoint stays inside the
+   package, and that the tests path exists, then runs the suite with
+   `python -m unittest discover`. The standard library runner is a deliberate
+   choice: pytest is a development dependency here, and a capability has to
+   validate on any installation. Zero discovered tests is a failure, as is any
+   non-zero exit code, so an empty suite cannot pass.
+3. **`foundry_install`** validates again, copies the package to
+   `<data_dir>/tools/<name>/<version>/`, records the entrypoint's SHA-256,
+   `installed_at`, the originating conversation and the test count in
+   `.integrity.json`, and registers the tool on the `generated` server disabled and
+   unapproved.
+
+### 10.2 Why installed packages leave the workspace
+
+The workspace is agent-writable through `fs_write`. A package kept there could be
+rewritten after the operator had reviewed and approved it, which would make an
+integrity hash meaningless. Installation copies the package out to
+`<data_dir>/tools/`, where no agent tool can write. One version per name is active;
+installing again replaces it and records the new version.
+
+### 10.3 The manifest is a proposal, not an enforcement layer
+
+`permissions.filesystem` and `permissions.network` record what the tool claims to
+need, and the Capabilities view shows them for review. The runtime does not act on
+them. An installed capability is a child process running as the operator with no
+OS-level isolation, so a script that ignores `network: false` still reaches the
+network. The fields are labelled as claims everywhere they appear rather than
+presented as a guarantee the runtime cannot keep.
+
+### 10.4 Execution
+
+`generated` dispatches in `MCPConnectionManager` beside the other transports.
+`ToolExecutor` has already validated the arguments against the stored schema, so the
+runner only maps them onto flags:
+
+- `--name value`, with underscores written as hyphens.
+- Booleans become a bare `--flag` when true and are omitted when false.
+- Arrays repeat the flag; objects are JSON-encoded.
+- Properties are emitted in sorted order, so one call always produces one argv.
+
+The child runs with the **conversation workspace as its working directory**, which
+is what makes `--input security-events.jsonl` meaningful from a conversation, and
+with the shared policy in `sandbox/_exec.py`: argv arrays only, a minimal
+environment, a wall-clock timeout, a combined output cap enforced while reading,
+and a process-tree kill on expiry. Before each run the entrypoint is re-hashed
+against the recorded value; a mismatch refuses the call instead of running it. The
+same policy module backs `python`, so there is one place where subprocess rules
+live.
+
+### 10.5 Gates
+
+`TOOLLOOM_ALLOW_FOUNDRY` (default `0`) gates all three authoring tools, because
+validation executes generated code. The tools also obey default-deny: `foundry_
+scaffold` starts disabled, and the two that run generated code additionally
+require approval. Installed capabilities are `risk: high` for the same reason. An
+operator who never sets the flag can never install anything, which is the property
+that makes it safe to let the agent write a capability on request at all.
+
+### 10.6 Capabilities view and API
+
+`GET /capabilities` returns each installed package with its version, declared
+permissions, install test count, provenance and current enable/approval state, so
+the view can show what was approved rather than recomputing it.
+`GET /capabilities/{name}/source` returns the CLI and its tests for review.
+`DELETE /capabilities/{name}` removes the installed package and re-syncs the
+catalogue. Enable and approval are not reimplemented: they go through
+`PATCH /mcp/servers/{id}/tools/{name}` like any other tool.
+
+### 10.7 What this deliberately does not do
+
+No skill generation, and no automatic capability creation. The `description` in the
+manifest carries the "when to use this" guidance the model needs, which covers the
+discovery problem Stage 3 was meant to solve without adding a second artifact to
+keep in sync.
+
+## 11. Data model
 
 SQLite through SQLAlchemy 2, with `foreign_keys=ON`, `journal_mode=WAL`,
 `synchronous=NORMAL` and a 30-second busy timeout. WAL matters here because
@@ -307,7 +409,7 @@ forward migration that inspects the schema and issues `ALTER TABLE ADD COLUMN`
 for columns introduced after a database was first created. That is how an
 existing `.local/toolloom.db` picks up new fields without data loss.
 
-## 11. Context management
+## 12. Context management
 
 Four mechanisms keep a long conversation inside the model's window. The window
 comes from the provider catalogue, and `MODEL_CONTEXT_WINDOW` can impose a
@@ -329,7 +431,7 @@ smaller local cap.
 
 There is no tokenizer dependency. Estimates are approximate and the UI says so.
 
-## 12. Concurrency
+## 13. Concurrency
 
 Run reservations are process-local: a set on the app state, plus a lock around
 transitions.
@@ -345,7 +447,7 @@ transitions.
 One Uvicorn worker is the supported topology. The reservation set is in memory,
 so multiple workers would not share it.
 
-## 13. Security boundaries
+## 14. Security boundaries
 
 Enforced in code:
 
@@ -358,6 +460,11 @@ Enforced in code:
   preview and never the value.
 - Skill archives are validated before extraction: no absolute paths, no `..`,
   no backslashes, no symlink entries, and a 25 MB expansion cap.
+- Generated capability packages are validated before installation: the manifest
+  must parse, the entrypoint and tests must resolve inside the package, and the
+  suite must run and pass. Installation copies the package to a directory no agent
+  tool can write to, and every run re-hashes the entrypoint against the value
+  recorded at approval.
 - Tool output, uploaded files and skill bodies are data. The system prompt says
   so, and inlined skill bodies have `</` neutralized so a skill cannot close its
   own tags.
@@ -367,6 +474,10 @@ Stated rather than papered over:
 - **`python` is not a sandbox.** It runs with your privileges. Time and output
   limits protect normal runs, not adversarial ones. Real isolation would need a
   container or a separate user account, which this project does not provide.
+- **A capability has the same limits, and no more.** Validation executes generated
+  tests and the installed tool executes generated code, both as your user. What
+  the runtime adds is review before installation, a hash check against later edits,
+  and the fact that nothing installs until an operator opts in.
 - **`http_fetch` resolves the hostname before connecting** rather than pinning
   the validated address, so a DNS-rebinding race remains theoretically possible.
 - **`web_search` reads an undocumented DuckDuckGo HTML endpoint.** That is a
@@ -376,7 +487,7 @@ Stated rather than papered over:
   follows instructions found in a web page is a model-level problem, bounded here
   by which tools are enabled and approved.
 
-## 14. Frontend
+## 15. Frontend
 
 Plain HTML, CSS and JavaScript served by FastAPI. No framework, no build step, no
 CDN at runtime: the Geist variable font is bundled with its licence.
@@ -390,7 +501,7 @@ rendered by a small local module, and rendered text is escaped first.
 Browser preferences (theme, model, motion) are stored locally. Transcript, usage,
 tool execution, workspace files and credentials stay backend-owned.
 
-## 15. Testing
+## 16. Testing
 
 The unit and integration suite runs offline: no key, no external network, no
 container.
@@ -401,6 +512,10 @@ container.
   HTTP, one over legacy SSE, and a child process over stdio.
 - The sandbox is tested for path traversal, symlink escape, malicious archives,
   secret exposure, output spilling and the search parsers.
+- Tool Foundry is tested through the real `ToolExecutor`: scaffolding, the test
+  gate rejecting zero tests and failing tests, installation landing outside the
+  workspace, flag mapping, tamper detection, removal, and the reserved-name rules
+  for the `generated` server.
 - The loop is tested for tool round trips, refusal paths, duplicate call guards,
   cancellation, orphan repair, compaction and resume.
 - API tests cover invalid input, missing ids, origin and host enforcement, and
@@ -410,7 +525,7 @@ Live checks that need a key, a browser or a paid call are opt-in and are not par
 of the default run. They use temporary databases, so they never touch your
 `.local/` data.
 
-## 16. Configuration
+## 17. Configuration
 
 Grouped by purpose. See `.env.example` for the full list.
 
@@ -420,6 +535,7 @@ Grouped by purpose. See `.env.example` for the full list.
 | Budgets | `MODEL_MAX_OUTPUT_TOKENS`, `MODEL_CONTEXT_WINDOW`, `TOOLLOOM_MAX_ITERATIONS`, `TOOLLOOM_MAX_TOOL_CALLS`, `TOOLLOOM_MAX_PARALLEL_TOOLS`, `TOOLLOOM_MAX_PAYLOAD_BYTES`, `TOOLLOOM_RUN_TIMEOUT_SECONDS` |
 | Server | `TOOLLOOM_HOST`, `TOOLLOOM_PORT`, `TOOLLOOM_DATA_DIR` |
 | Capabilities | `TOOLLOOM_ALLOW_STDIO`, `TOOLLOOM_ALLOW_PYTHON`, `TOOLLOOM_PYTHON_TIMEOUT_SECONDS`, `TOOLLOOM_PYTHON_OUTPUT_BYTES` |
+| Tool Foundry | `TOOLLOOM_ALLOW_FOUNDRY`, `TOOLLOOM_FOUNDRY_TIMEOUT_SECONDS`, `TOOLLOOM_FOUNDRY_TEST_TIMEOUT_SECONDS`, `TOOLLOOM_FOUNDRY_OUTPUT_BYTES` |
 | Search | `TOOLLOOM_SEARCH_PROVIDER`, `TOOLLOOM_SEARCH_URL`, `TOOLLOOM_SEARCH_MAX_RESULTS`, `TOOLLOOM_SEARCH_TIMEOUT_SECONDS` |
 | Behaviour | `TOOLLOOM_AUTO_TITLES`, `TOOLLOOM_SEED_DEMO` |
 | Vault | `TOOLLOOM_SECRETS_KEY` |
@@ -428,7 +544,7 @@ Grouped by purpose. See `.env.example` for the full list.
 Invalid enum values fail at startup. Cost figures appear only when you supply
 prices; token counts are always reported and no price is ever invented.
 
-## 17. Deliberate non-goals
+## 18. Deliberate non-goals
 
 Each of these was considered and left out on purpose. They are not oversights.
 

@@ -103,6 +103,14 @@ class Settings(BaseSettings):
     toolloom_price_input_per_1k: float | None = None
     toolloom_price_output_per_1k: float | None = None
 
+    # Tool Foundry: generate, validate and install reusable CLI capabilities.
+    # Off by default because validation runs generated code. Installed tools are
+    # additionally disabled and unapproved until the operator turns them on.
+    toolloom_allow_foundry: bool = False
+    toolloom_foundry_timeout_seconds: int = Field(default=30, ge=1, le=600)
+    toolloom_foundry_test_timeout_seconds: int = Field(default=60, ge=1, le=600)
+    toolloom_foundry_output_bytes: int = Field(default=64_000, ge=1_024, le=1_000_000)
+
     @property
     def data_dir(self) -> Path:
         return (self.toolloom_data_dir or (REPO_ROOT / ".local")).resolve()
