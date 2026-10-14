@@ -1,0 +1,303 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
+
+from backend.runtime.events import DONE, AgentEvent
+from backend.schemas import (
+    ConversationDetail,
+    ConversationSummary,
+    CreateConversationRequest,
+    SendMessageRequest,
+)
+from backend.schemas.responses import SendMessageResponse, ToolCallTrace
+from backend.services import uploads as upload_service
+from backend.services.conversation_service import ConversationService
+from backend.services.sandbox.workspace import workspace_for
+from backend.services.uploads import UploadError
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+CONTINUE_PROMPT = "Continue from where you stopped."
+
+
+def _service(request: Request) -> ConversationService:
+    return ConversationService(request.app.state.db, request.app.state.settings)
+
+
+def _workspace(request: Request, conversation_id: str):
+    return workspace_for(request.app.state.settings.workspaces_dir, conversation_id)
+
+
+def _sse(event: AgentEvent) -> str:
+    payload = json.dumps(event.data, default=str)
+    return f"event: {event.kind}\ndata: {payload}\n\n"
+
+
+def _with_attachments(
+    request: Request, conversation_id: str, message: str, paths: list[str]
+) -> tuple[str, list[dict]]:
+    if not paths:
+        return message, []
+    workspace = _workspace(request, conversation_id)
+    saved = []
+    for path in paths:
+        try:
+            saved.append(upload_service.load_saved_upload(workspace, path))
+        except UploadError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    block = upload_service.build_attachment_preview(saved)
+    return (f"{block}\n\n{message}" if message else block), upload_service.attachment_metadata(
+        saved
+    )
+
+
+def _result(final: dict) -> SendMessageResponse:
+    return SendMessageResponse(
+        reply=final["reply"],
+        iterations=final["iterations"],
+        stop_reason=final["stop_reason"],
+        usage=final["usage"],
+        tool_calls=[ToolCallTrace(**t) for t in final["tool_calls"]],
+    )
+
+
+def _start(request, conversation_id, text, *, is_resume=False, user_text=None, attachments=None):
+    active = request.app.state.active_runs
+    if conversation_id in active:
+        raise HTTPException(status_code=409, detail="conversation already has an active run")
+    if len(active) >= 16:
+        raise HTTPException(status_code=429, detail="too many active runs; try again shortly")
+    if (
+        _service(request).add_user_message(
+            conversation_id, text, is_resume=is_resume, user_text=user_text, attachments=attachments
+        )
+        is None
+    ):
+        raise HTTPException(status_code=404, detail="conversation not found")
+    active.add(conversation_id)
+
+
+async def _events(request, conversation_id, model_id):
+    finished = None
+    try:
+        async with asyncio.timeout(request.app.state.settings.toolloom_run_timeout_seconds):
+            async for event in request.app.state.runtime.run_stream(
+                conversation_id, model_id=model_id
+            ):
+                if event.kind == DONE:
+                    finished = event
+                else:
+                    yield event
+    except TimeoutError:
+        yield AgentEvent(
+            "error",
+            {
+                "message": "Run time limit reached. You can continue the conversation.",
+                "status": 504,
+            },
+        )
+    except Exception as exc:
+        logger.error("Run boundary failed (%s)", type(exc).__name__)
+        yield AgentEvent(
+            "error",
+            {"message": "Run failed unexpectedly. Retry or check backend storage.", "status": 500},
+        )
+    if finished is not None:
+        if finished.data.get("stop_reason") == "end_turn":
+            # Title latency/failure must not consume the completed agent run's deadline.
+            try:
+                await request.app.state.conversation_titles.generate(conversation_id, model_id)
+            except Exception as exc:
+                # Metadata/storage errors here must not turn a saved reply into failure.
+                logger.warning("Title update failed (%s)", type(exc).__name__)
+        yield finished
+
+
+async def _drain(request, conversation_id, model_id):
+    final = None
+    failure = {}
+    try:
+        async for event in _events(request, conversation_id, model_id):
+            if event.kind == DONE:
+                final = event.data
+            elif event.kind == "error":
+                failure = event.data
+    finally:
+        request.app.state.active_runs.discard(conversation_id)
+    if final is None:
+        raise HTTPException(
+            status_code=failure.get("status", 502),
+            detail=failure.get("message", "agent produced no result"),
+        )
+    return final
+
+
+class _RunResponse(StreamingResponse):
+    def __init__(self, request, conversation_id, model_id):
+        self.active = request.app.state.active_runs
+        self.conversation_id = conversation_id
+
+        async def source():
+            async for event in _events(request, conversation_id, model_id):
+                yield _sse(event)
+
+        super().__init__(source(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.active.discard(self.conversation_id)
+
+
+# --- conversations -----------------------------------------------------------
+
+
+@router.post("", response_model=ConversationSummary, status_code=201)
+def create_conversation(body: CreateConversationRequest, request: Request) -> dict:
+    return _service(request).create(body.title)
+
+
+@router.get("", response_model=list[ConversationSummary])
+def list_conversations(request: Request) -> list[dict]:
+    return _service(request).list()
+
+
+@router.get("/{conversation_id}", response_model=ConversationDetail)
+def get_conversation(conversation_id: str, request: Request) -> dict:
+    detail = _service(request).get(conversation_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return detail
+
+
+@router.delete("/{conversation_id}", status_code=204)
+async def delete_conversation(conversation_id: str, request: Request) -> None:
+    if conversation_id in request.app.state.active_runs:
+        raise HTTPException(status_code=409, detail="stop the active run before deleting")
+    if not _service(request).delete(conversation_id):
+        raise HTTPException(status_code=404, detail="conversation not found")
+    workspace = _workspace(request, conversation_id)
+    try:
+        import shutil
+
+        if workspace.root.exists():
+            shutil.rmtree(workspace.root, ignore_errors=True)
+    except Exception:
+        pass  # best-effort cleanup; a stale lock must not fail the delete
+
+
+# --- turns -------------------------------------------------------------------
+
+
+@router.post("/{conversation_id}/messages", response_model=SendMessageResponse)
+async def send_message(
+    conversation_id: str, body: SendMessageRequest, request: Request
+) -> SendMessageResponse:
+    if _service(request).get(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    text, attachments = _with_attachments(request, conversation_id, body.message, body.attachments)
+    _start(request, conversation_id, text, user_text=body.message, attachments=attachments)
+    return _result(await _drain(request, conversation_id, body.model_id))
+
+
+@router.post("/{conversation_id}/messages/stream")
+async def stream_message(conversation_id: str, body: SendMessageRequest, request: Request):
+    if _service(request).get(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    text, attachments = _with_attachments(request, conversation_id, body.message, body.attachments)
+    _start(request, conversation_id, text, user_text=body.message, attachments=attachments)
+    return _RunResponse(request, conversation_id, body.model_id)
+
+
+@router.post("/{conversation_id}/continue", response_model=SendMessageResponse)
+async def continue_turn(conversation_id: str, request: Request, model_id: str | None = None):
+    _start(request, conversation_id, CONTINUE_PROMPT, is_resume=True)
+    return _result(await _drain(request, conversation_id, model_id))
+
+
+@router.post("/{conversation_id}/continue/stream")
+async def continue_stream(conversation_id: str, request: Request, model_id: str | None = None):
+    _start(request, conversation_id, CONTINUE_PROMPT, is_resume=True)
+    return _RunResponse(request, conversation_id, model_id)
+
+
+# --- files & workspace -------------------------------------------------------
+
+
+@router.post("/{conversation_id}/files", status_code=201)
+async def upload_files(
+    conversation_id: str, request: Request, files: list[UploadFile] = File(...)
+) -> dict:
+    if _service(request).get(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    workspace = _workspace(request, conversation_id)
+    saved = []
+    if len(files) > 10:
+        raise HTTPException(status_code=400, detail="at most 10 files per upload")
+    for upload in files:
+        raw = await upload.read(upload_service.MAX_UPLOAD_BYTES + 1)
+        try:
+            saved.append(upload_service.save_upload(workspace, upload.filename or "upload", raw))
+        except UploadError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "files": [
+            {
+                "name": item.name,
+                "path": item.path,
+                "size_bytes": item.size_bytes,
+                "inlined": item.inlined,
+            }
+            for item in saved
+        ]
+    }
+
+
+@router.get("/{conversation_id}/workspace")
+def list_workspace(conversation_id: str, request: Request) -> dict:
+    if _service(request).get(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    workspace = _workspace(request, conversation_id)
+    entries = []
+    for path in sorted(workspace.root.rglob("*")):
+        if not path.is_file() or workspace.is_hidden(path):
+            continue
+        stat = path.stat()
+        entries.append(
+            {
+                "name": path.name,
+                "path": workspace.relative(path),
+                "size_bytes": stat.st_size,
+                "modified_at": stat.st_mtime,
+            }
+        )
+    entries.sort(key=lambda item: item["modified_at"], reverse=True)
+    return {"files": entries[:500]}
+
+
+@router.get("/{conversation_id}/workspace/download")
+def download_workspace_file(conversation_id: str, path: str, request: Request) -> FileResponse:
+    if _service(request).get(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    workspace = _workspace(request, conversation_id)
+    try:
+        target = workspace.resolve(path, must_exist=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if workspace.is_hidden(target) or not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(target, filename=target.name)

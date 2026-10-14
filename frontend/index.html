@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="description" content="Your workspace for focused conversations, connected tools, and thoughtful work." />
+    <title>ToolLoom — Your workspace</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preload" href="/fonts/Geist.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="shell" id="shell">
+      <!-- plane 1: sessions rail -->
+      <aside class="rail" id="rail" aria-label="Sessions">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3"><path d="M5 3v14a4 4 0 0 0 4 4h12M3 7h14a4 4 0 0 1 4 4v10M11 3v12a2 2 0 0 0 2 2h8M3 13h10a2 2 0 0 1 2 2v6"/></svg></span>
+          <span class="brand-name">ToolLoom<span class="brand-period">.</span></span>
+          <span class="local-tag">LOCAL</span>
+        </div>
+        <div class="rail-actions">
+          <button class="btn btn-primary btn-wide" id="newSessionBtn" type="button"><span data-icon="plus"></span>New session<kbd>⌘ / Ctrl J</kbd></button>
+        </div>
+        <div class="search-wrap">
+          <span data-icon="search"></span>
+          <label class="sr-only" for="sessionSearch">Find a session</label>
+          <input id="sessionSearch" type="search" autocomplete="off" placeholder="Search sessions" />
+        </div>
+        <nav class="workspace-nav" aria-label="Workspace">
+          <button class="nav-link" type="button" data-settings-tab="mcp"><span data-icon="tools"></span>Tools & connections<span class="nav-arrow">↗</span></button>
+          <button class="nav-link" type="button" data-settings-tab="skills"><span data-icon="layers"></span>Skills<span class="nav-arrow">↗</span></button>
+        </nav>
+        <div class="section-label">Your sessions<span id="sessionCount">0</span></div>
+        <nav class="sessions" id="sessionList" aria-label="Session list"></nav>
+        <div class="rail-foot">
+          <div class="workspace-identity"><span class="workspace-avatar">TL</span><div><strong>Personal workspace</strong><span class="brand-sub" id="providerLine">Connecting…</span></div><button class="btn btn-quiet btn-icon" id="themeBtn" type="button" aria-label="Use dark theme"></button></div>
+          <div class="foot-row"><span class="usage" id="usageLine">Usage unavailable</span><label class="check motion-check" for="motionToggle"><input type="checkbox" id="motionToggle" /> Less motion</label></div>
+        </div>
+      </aside>
+
+      <!-- plane 2: workbench -->
+      <main class="workbench">
+        <header class="statusbar">
+          <button class="btn btn-quiet btn-icon" id="railToggle" type="button" aria-label="Show sessions" aria-expanded="false" aria-controls="rail"><span data-icon="sidebar"></span></button>
+          <span class="breadcrumb">Workspace<span>/</span></span><h1 class="session-title-head" id="sessionTitle">New session</h1>
+          <span class="state-chip" id="stateChip" data-state="idle"><span class="lamp" aria-hidden="true"></span><span id="stateLabel">Ready</span></span>
+          <button class="btn" id="continueBtn" type="button" hidden>Continue run</button>
+          <button class="btn btn-quiet" id="inspectorToggle" type="button" aria-label="Session details" aria-expanded="false" aria-controls="inspector"><span data-icon="panel"></span><span class="button-label">Details</span></button>
+          <button class="btn btn-quiet btn-icon" id="settingsBtn" type="button" aria-label="Open settings" title="Settings"><span data-icon="settings"></span></button>
+        </header>
+        <section class="log" id="log" tabindex="-1">
+          <div class="log-inner">
+            <div class="log-empty" id="logEmpty">
+              <div class="loom-emblem" aria-hidden="true"><svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M16 8v36a12 12 0 0 0 12 12h28M8 16h36a12 12 0 0 1 12 12v28M28 8v30a6 6 0 0 0 6 6h22M8 28h30a6 6 0 0 1 6 6v22"/></svg></div>
+              <div class="eyebrow">A little space to think</div>
+              <h2>Let’s get to <em>work.</em></h2>
+              <p>A question, a rough idea, a task worth doing.<br>Bring it here. We’ll take it from there.</p>
+            </div>
+            <ol class="turns" id="turns"></ol>
+          </div>
+        </section>
+
+        <div class="bench">
+          <div class="composer-wrap">
+            <div class="chips" id="chips" hidden></div>
+            <form class="composer" id="composer">
+              <div class="composer-field"><label class="sr-only" for="promptInput">Message</label><textarea id="promptInput" rows="2" placeholder="What would you like to work on?" aria-describedby="composerHint"></textarea></div>
+              <div class="composer-actions">
+                <button class="btn btn-quiet btn-icon" id="attachBtn" type="button" aria-label="Attach files" title="Attach files"><span data-icon="plus"></span></button>
+                <input type="file" id="fileInput" class="sr-only" aria-label="Attach workspace files" tabindex="-1" multiple accept=".txt,.md,.markdown,.py,.json,.csv" />
+                <div class="model-control"><span class="model-dot" aria-hidden="true"></span><label class="sr-only" for="modelSelect">Model</label><select id="modelSelect" aria-label="Model"><option>Loading models…</option></select></div>
+                <span class="composer-spacer"></span>
+                <button class="btn" id="continueBtnBench" type="button" hidden>Continue</button>
+                <button class="btn btn-primary btn-icon" id="sendBtn" type="submit" aria-label="Send message" title="Send message"><span data-icon="arrowUp"></span></button>
+                <button class="btn btn-icon" id="stopBtn" type="button" aria-label="Stop run" title="Stop run" hidden><span data-icon="stop"></span></button>
+              </div>
+            </form>
+          </div>
+          <div class="starters" id="starters" aria-label="Ways to get started">
+            <button class="starter" type="button" data-prompt="Help me think through an idea. Ask me what I’m considering, then challenge the assumptions and help me find a practical next step."><span data-icon="lightbulb"></span><span>Think it through</span><span class="starter-arrow">↗</span></button>
+            <button class="starter" type="button" id="starterFile"><span data-icon="file"></span><span>Work with a file</span><span class="starter-arrow">↗</span></button>
+            <button class="starter" type="button" data-settings-tab="mcp"><span data-icon="tools"></span><span>Connect your tools</span><span class="starter-arrow">↗</span></button>
+          </div>
+          <div class="run-mode">
+            <label class="check switch-label" title="Remove step and tool-count limits for enabled, approved tools">
+              <input type="checkbox" class="toggle-control" role="switch" id="unlimitedTools" aria-describedby="runModeHelp" disabled><span>Unlimited steps</span>
+            </label>
+            <span class="run-mode-help" id="runModeHelp">Enabled tools only · timeouts still apply</span>
+          </div>
+          <p class="composer-hint" id="composerHint"><span id="modelContext" aria-live="polite">Reading model context…</span><span>Enter to send <span aria-hidden="true">·</span> Shift + Enter for a new line</span></p>
+        </div>
+      </main>
+
+      <!-- plane 3: readout inspector -->
+      <aside class="inspector" id="inspector" aria-label="Run readout">
+        <div class="insp-head">
+          <div class="insp-title">Session details</div><button class="btn btn-quiet btn-icon" id="closeInspectorBtn" type="button" aria-label="Close details"><span data-icon="close"></span></button>
+        </div>
+
+        <section class="insp-section">
+          <div class="insp-title">Last turn</div>
+          <dl class="readout">
+            <dt>Stop reason</dt><dd id="readStop" class="muted">—</dd>
+            <dt>Iterations</dt><dd id="readIters">0</dd>
+            <dt>Input tokens</dt><dd id="readIn">0</dd>
+            <dt>Output tokens</dt><dd id="readOut">0</dd>
+            <dt>Tool calls</dt><dd id="readTools">0</dd>
+          </dl>
+        </section>
+
+        <section class="insp-section">
+          <div class="insp-title">Enabled tools</div>
+          <div class="rows" id="toolList"></div>
+        </section>
+
+        <section class="insp-section">
+          <div class="insp-title">Workspace files</div>
+          <div class="rows" id="fileList"></div>
+        </section>
+      </aside>
+    </div>
+
+    <div class="scrim" id="drawerScrim" hidden></div>
+    <p class="sr-only" id="live" aria-live="polite" aria-atomic="true"></p>
+    <p class="sr-only" id="alerts" role="alert" aria-atomic="true"></p>
+    <div class="toasts" id="toasts"></div>
+
+    <!-- settings dialog -->
+    <div class="scrim" id="settingsScrim" hidden></div>
+    <section class="dialog" id="settingsDialog" role="dialog" aria-modal="true"
+             aria-labelledby="dialogTitle" hidden>
+      <div class="dialog-head">
+        <h2 id="dialogTitle">Settings</h2>
+        <button class="btn btn-quiet btn-icon" id="closeDialogBtn" type="button" aria-label="Close settings">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor"
+               stroke-width="1.5" aria-hidden="true"><path d="M3 3l8 8M11 3l-8 8" /></svg>
+        </button>
+      </div>
+
+      <nav class="tabs" id="panelTabs" role="tablist" aria-label="Settings sections">
+        <button class="tab" id="tab-mcp" role="tab" aria-selected="true" aria-controls="panel-mcp" data-tab="mcp" type="button">MCP</button>
+        <button class="tab" id="tab-skills" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-skills" data-tab="skills" type="button">Skills</button>
+        <button class="tab" id="tab-secrets" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-secrets" data-tab="secrets" type="button">Secrets</button>
+        <button class="tab" id="tab-prompt" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-prompt" data-tab="prompt" type="button">Prompt</button>
+      </nav>
+
+      <div class="dialog-body" id="dialogBody">
+        <section class="group" id="panel-mcp" role="tabpanel" aria-labelledby="tab-mcp" data-panel="mcp">
+          <div>
+            <div class="group-head">Connected tools</div><p class="hint">Give your workspace new capabilities. You choose which tools can run.</p>
+            <div class="rows" id="serverList"></div>
+          </div>
+          <details class="config-panel" open>
+            <summary>mcp.json <span class="hint">Import, edit & export</span></summary>
+            <p class="hint">Manage HTTP, SSE, and stdio servers in one configuration. Saved servers live locally; built-in tools are managed above.</p>
+            <div class="group-actions">
+              <button class="btn" id="importFileBtn" type="button"><span data-icon="file"></span>Import mcp.json</button>
+              <input class="sr-only" id="mcpConfigFile" type="file" accept=".json,.jsonc,application/json" aria-label="Choose an MCP config file" tabindex="-1" />
+              <button class="btn btn-quiet" id="currentConfigBtn" type="button">View current config</button>
+              <button class="btn btn-quiet" id="downloadConfigBtn" type="button">Download current</button>
+            </div>
+            <div class="field">
+              <label class="field-label" for="importText">Configuration (JSON or JSON with comments)</label>
+              <textarea id="importText" rows="10" spellcheck="false" placeholder='{ "mcpServers": { "my-server": { "url": "http://localhost:9000/mcp" } } }'></textarea>
+            </div>
+            <p class="hint">New or changed connections stay disabled until you enable them. Stored credentials are masked; keep their placeholders to preserve them.</p>
+            <label class="check" for="importSync"><input class="toggle-control" role="switch" type="checkbox" id="importSync" /> Remove servers missing from this config</label>
+            <p class="hint" id="stdioStatus"></p>
+            <p id="configFeedback" class="config-feedback" role="status" hidden></p>
+            <div class="group-actions"><button class="btn btn-primary" id="importBtn" type="button">Apply configuration</button></div>
+          </details>
+        </section>
+
+        <section class="group" id="panel-skills" role="tabpanel" aria-labelledby="tab-skills" data-panel="skills" hidden>
+          <div>
+            <div class="group-head">Install a skill</div>
+            <div class="field">
+              <label class="field-label" for="skillFile">SKILL.md bundle (.zip, .md)</label>
+              <div class="skill-upload-row">
+                <input id="skillFile" type="file" accept=".zip,.md,.markdown" />
+                <div class="group-actions">
+                  <button class="btn btn-primary" id="skillUploadBtn" type="button">Upload skill</button>
+                  <button class="btn" id="skillRescanBtn" type="button">Rescan folder</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div>
+            <div class="group-head">Installed</div>
+            <div class="rows" id="skillList"></div>
+          </div>
+        </section>
+
+        <section class="group" id="panel-secrets" role="tabpanel" aria-labelledby="tab-secrets" data-panel="secrets" hidden>
+          <div>
+            <div class="group-head">Add or rotate a secret</div>
+            <div class="field">
+              <label class="field-label" for="secretName">Name</label>
+              <input id="secretName" type="text" placeholder="my_token" />
+            </div>
+            <div class="field" style="margin-top: var(--s3)">
+              <label class="field-label" for="secretValue">Value</label>
+              <input id="secretValue" type="password" placeholder="stored encrypted; never shown again" />
+            </div>
+            <div class="rows"><button class="btn btn-primary" id="secretSaveBtn" type="button">Save secret</button></div>
+          </div>
+          <div>
+            <div class="group-head">Stored</div>
+            <p class="hint">Only a masked preview is ever returned.</p>
+            <div class="rows" id="secretList"></div>
+          </div>
+        </section>
+
+        <section class="group" id="panel-prompt" role="tabpanel" aria-labelledby="tab-prompt" data-panel="prompt" hidden>
+          <div>
+            <div class="group-head">Global system prompt</div>
+            <div class="field">
+              <label class="field-label" for="promptText">Operator instructions</label>
+              <textarea id="promptText" rows="8" placeholder="Applies to every session, below your message."></textarea>
+            </div>
+            <div class="rows"><button class="btn btn-primary" id="promptSaveBtn" type="button">Save prompt</button></div>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <dialog class="delete-dialog" id="deleteDialog" aria-labelledby="deleteTitle" aria-describedby="deleteDescription deleteSessionName">
+      <div class="delete-dialog-icon" aria-hidden="true"><span data-icon="trash"></span></div>
+      <h2 id="deleteTitle">Delete this chat?</h2>
+      <p class="delete-session-name" id="deleteSessionName"></p>
+      <p id="deleteDescription">This will permanently delete the conversation and its workspace files. This can’t be undone.</p>
+      <p class="delete-error" id="deleteError" role="alert" hidden></p>
+      <div class="delete-dialog-actions">
+        <button class="btn" id="cancelDeleteBtn" type="button" autofocus>Cancel</button>
+        <button class="btn btn-danger" id="confirmDeleteBtn" type="button">Delete chat</button>
+      </div>
+    </dialog>
+
+    <script src="/vendor/markdown-it.min.js"></script>
+    <script src="/markdown.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

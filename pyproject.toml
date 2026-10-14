@@ -1,0 +1,60 @@
+[project]
+name = "toolloom"
+version = "0.1.0"
+description = "Local-first, single-user, model-agnostic AI agent runtime with persistent conversations, workspaces and MCP tools."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.3,<3.0",
+    "sqlalchemy>=2.0.30,<3.0",
+    "python-dotenv>=1.0,<2.0",
+    "httpx>=0.27,<1.0",
+    "jsonschema>=4.22,<5.0",
+    "cryptography>=42,<46",
+    "mcp>=1.30.0",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.40,<2.0"]
+anthropic = ["anthropic>=0.34,<1.0"]
+mcp = ["mcp>=1.2,<2.0"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.23,<1.0",
+    "ruff>=0.5,<1.0",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["backend"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# SQLAlchemy relationship annotations are quoted forward references on purpose.
+"backend/models/*.py" = ["UP037"]
+# Wire-frame fixtures are long single-line JSON on purpose.
+"backend/tests/*.py" = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

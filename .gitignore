@@ -1,0 +1,51 @@
+# Local runtime data: SQLite DB, vault key, per-conversation workspaces, logs
+.local/
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Internal material: not published in this repository.
+# These stay in the working tree but are excluded from git, so a fresh clone
+# does not contain them. They are local working notes, not product files.
+# Leading slashes anchor these to the repository root on purpose: an unanchored
+# `tests/` would also ignore backend/tests/.
+/Old_Docs/
+/docs/
+/tests/
+/AGENTS.md
+/BUILD_SPEC.md
+/DECISIONS.md
+/IMPLEMENTATION_PLAN.md
+/START_HERE.txt
+/.commandcode/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.directory
+
+# uv lock is committed; caches are not
+uv.lock.bak
