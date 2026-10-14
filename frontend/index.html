@@ -34,7 +34,7 @@
         <div class="section-label">Your sessions<span id="sessionCount">0</span></div>
         <nav class="sessions" id="sessionList" aria-label="Session list"></nav>
         <div class="rail-foot">
-          <div class="workspace-identity"><span class="workspace-avatar">TL</span><div><strong>Personal workspace</strong><span class="brand-sub" id="providerLine">Connecting…</span></div><button class="btn btn-quiet btn-icon" id="themeBtn" type="button" aria-label="Use dark theme"></button></div>
+          <div class="workspace-identity"><button class="workspace-open" id="workspaceSettingsBtn" type="button" aria-haspopup="dialog" aria-label="Open settings for Personal workspace" title="Settings"><span class="workspace-avatar">TL</span><span class="workspace-copy"><strong>Personal workspace</strong><span class="brand-sub" id="providerLine">Connecting…</span></span></button><button class="btn btn-quiet btn-icon" id="themeBtn" type="button" aria-label="Use dark theme"></button></div>
           <div class="foot-row"><span class="usage" id="usageLine">Usage unavailable</span><label class="check motion-check" for="motionToggle"><input type="checkbox" id="motionToggle" /> Less motion</label></div>
         </div>
       </aside>
@@ -110,12 +110,17 @@
         </section>
 
         <section class="insp-section">
-          <div class="insp-title">Enabled tools</div>
-          <div class="rows" id="toolList"></div>
+          <details class="insp-details" id="toolSection" open>
+            <summary><span data-icon="chevron"></span><span class="insp-title">Tools</span><span class="hint num" id="toolCount"></span></summary>
+            <div class="rows" id="toolList"></div>
+          </details>
         </section>
 
         <section class="insp-section">
-          <div class="insp-title">Workspace files</div>
+          <div class="insp-title-row">
+            <span class="insp-title">Workspace files</span>
+            <button class="btn btn-quiet btn-mini" id="downloadAllBtn" type="button" hidden>Download all</button>
+          </div>
           <div class="rows" id="fileList"></div>
         </section>
       </aside>

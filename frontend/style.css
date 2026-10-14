@@ -76,6 +76,34 @@ kbd { font: 10px var(--ui); opacity: .8; margin-left: auto; }
 .workspace-identity strong { display: block; font-size: 11px; font-weight: 550; }
 .brand-sub { display: block; color: var(--ink-2); font-size: 10px; max-width: 132px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-identity > .btn { margin-left: auto; }
+/* The workspace block doubles as the settings entry point, as in most tool UIs. */
+.workspace-open {
+  display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0;
+  margin: -4px; padding: 4px; border: 1px solid transparent; border-radius: 10px;
+  background: none; color: inherit; font: inherit; text-align: left; cursor: pointer;
+  transition: background-color 150ms var(--ease), border-color 150ms var(--ease);
+}
+.workspace-open:hover { background: var(--sunken); border-color: var(--rule); }
+.workspace-open:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+.workspace-copy { display: flex; flex-direction: column; min-width: 0; }
+/* Collapsible inspector sections. */
+.insp-details { display: flex; flex-direction: column; }
+.insp-details > summary { display: flex; align-items: center; gap: 7px; cursor: pointer; list-style: none; }
+.insp-details > summary::-webkit-details-marker { display: none; }
+.insp-details > summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 3px; border-radius: 6px; }
+.insp-details > summary svg { color: var(--ink-2); transition: transform 150ms var(--ease); }
+.insp-details[open] > summary svg { transform: rotate(90deg); }
+.insp-details > *:not(summary) { margin-top: var(--s3); }
+.insp-title-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* Tools are grouped by the server they came from. */
+.tool-group { display: flex; flex-direction: column; gap: var(--s2); }
+.tool-group + .tool-group { margin-top: var(--s4); }
+.insp-subhead {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s2);
+  font-size: var(--t-meta); font-weight: 550; color: var(--ink-2);
+  letter-spacing: .04em; text-transform: uppercase;
+}
+.btn-mini { min-height: 26px; padding: 0 10px; font-size: var(--t-meta); }
 .foot-row { display: flex; justify-content: space-between; gap: 5px; margin-top: 16px; align-items: center; }
 .usage,.motion-check { font-size: 9px !important; color: var(--ink-2); }
 .motion-check { gap: 3px !important; }.motion-check input { width: 11px; height: 11px; }
@@ -431,7 +459,7 @@ input[type="file"]::file-selector-button:hover { background: var(--sunken); }
 /* Tool progress stays available without competing with the final answer. */
 .activity { border: 1px solid var(--rule); border-radius: 10px; background: var(--panel); }
 .activity-summary { padding: 12px 15px; cursor: pointer; color: var(--ink-2); font-size: 12px; }
-.activity-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.activity-summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 3px; }
 .activity[open] > .activity-summary { border-bottom: 1px solid var(--rule); }
 .activity-content { padding: 4px 15px 15px; }
 .activity-step { padding-top: 12px; }

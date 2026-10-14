@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
+import zipfile
+from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -23,6 +26,10 @@ from backend.services.uploads import UploadError
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+# Workspace archives are built in memory, so the total is bounded rather than
+# streamed from disk. A larger workspace can still be downloaded file by file.
+MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -301,3 +308,43 @@ def download_workspace_file(conversation_id: str, path: str, request: Request) -
     if workspace.is_hidden(target) or not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
     return FileResponse(target, filename=target.name)
+
+
+@router.get("/{conversation_id}/workspace/download-all")
+def download_workspace_archive(conversation_id: str, request: Request) -> StreamingResponse:
+    """Zip the whole workspace, applying the same rules as the file listing."""
+    if _service(request).get(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    workspace = _workspace(request, conversation_id)
+
+    files: list[tuple[str, Path]] = []
+    total = 0
+    for path in sorted(workspace.root.rglob("*")):
+        if not path.is_file() or workspace.is_hidden(path):
+            continue
+        total += path.stat().st_size
+        if total > MAX_ARCHIVE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "this workspace is larger than the "
+                    f"{MAX_ARCHIVE_BYTES // (1024 * 1024)} MB archive limit; "
+                    "download individual files instead"
+                ),
+            )
+        files.append((workspace.relative(path), path))
+    if not files:
+        raise HTTPException(status_code=404, detail="workspace is empty")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, path in files:
+            archive.write(path, arcname=name)
+    buffer.seek(0)
+
+    filename = f"workspace-{conversation_id[:8]}.zip"
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

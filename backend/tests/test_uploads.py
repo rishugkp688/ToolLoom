@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import zipfile
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -28,6 +31,43 @@ def test_upload_list_download_roundtrip(client):
     )
     assert download.status_code == 200
     assert b"body text" in download.content
+
+
+def test_workspace_archive_contains_every_visible_file(client):
+    conversation = client.post("/conversations", json={}).json()
+    cid = conversation["id"]
+    for name in ("notes.md", "report.csv"):
+        client.post(
+            f"/conversations/{cid}/files",
+            files={"files": (name, b"payload\n", "text/plain")},
+        )
+    workspace = client.app.state.settings.workspaces_dir / cid
+    (workspace / "nested").mkdir(parents=True, exist_ok=True)
+    (workspace / "nested" / "deep.txt").write_text("deep\n", encoding="utf-8")
+    # Scratch directories are hidden from listings, so they stay out of the archive.
+    (workspace / ".transcripts").mkdir(parents=True, exist_ok=True)
+    (workspace / ".transcripts" / "call_1.txt").write_text("internal\n", encoding="utf-8")
+
+    response = client.get(f"/conversations/{cid}/workspace/download-all")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert "attachment" in response.headers["content-disposition"]
+
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        names = set(archive.namelist())
+        assert {"notes.md", "report.csv", "nested/deep.txt"} <= names
+        assert not any(name.startswith(".") for name in names)
+        assert archive.read("notes.md") == b"payload\n"
+        assert archive.read("nested/deep.txt") == b"deep\n"
+
+
+def test_workspace_archive_rejects_an_empty_workspace(client):
+    cid = client.post("/conversations", json={}).json()["id"]
+    assert client.get(f"/conversations/{cid}/workspace/download-all").status_code == 404
+
+
+def test_workspace_archive_rejects_an_unknown_conversation(client):
+    assert client.get("/conversations/missing/workspace/download-all").status_code == 404
 
 
 def test_upload_rejects_unsupported_extension(client):

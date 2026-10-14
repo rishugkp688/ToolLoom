@@ -47,8 +47,10 @@ installed capability arrives disabled and unapproved with its source available f
 review. See [Capabilities](#capabilities-tool-foundry).
 
 **Gives each conversation a workspace.** The agent reads, writes, greps and
-deletes files in its own directory. You can attach files with the paperclip and
-download anything it produces from the details panel.
+deletes files in its own directory. You can attach files with the paperclip, and
+download anything it produces — one file, or the whole workspace as a zip — from
+the details panel. The panel lists the tools this session can call, grouped by the
+server each came from, and lets you switch one off without leaving the conversation.
 
 **Keeps the record honest.** Stop reasons, tool inputs and outputs, usage,
 compaction and interruptions are persisted. Reload a conversation and you see

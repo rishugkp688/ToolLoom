@@ -53,6 +53,8 @@ const ICON_PATHS = {
   spark: '<path d="M12 3v5M12 16v5M4.5 12h5M14.5 12h5M7 7l3 3M14 14l3 3M17 7l-3 3M10 14l-3 3"/>',
   check: '<path d="m5 13 4 4L19 7"/>',
   code: '<path d="m9 8-5 4 5 4M15 8l5 4-5 4"/>',
+  chevron: '<path d="m9 6 6 6-6 6"/>',
+  power: '<path d="M12 3v9"/><path d="M6.5 6.5a8 8 0 1 0 11 0"/>',
 };
 function icon(name) {
   return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name] || ""}</svg>`;
@@ -831,6 +833,16 @@ function updateReadout(done) {
   $("readTools").textContent = (done.tool_calls || []).length;
 }
 
+function groupByServer(tools) {
+  const groups = new Map();
+  for (const tool of tools) {
+    const key = tool.server_name || "unknown source";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(tool);
+  }
+  return groups;
+}
+
 async function refreshInspector() {
   const toolHost = $("toolList");
   if (state.toolsDirty || !state.toolCache) {
@@ -840,7 +852,11 @@ async function refreshInspector() {
       for (const server of await api("/mcp/servers")) {
         if (!server.enabled) continue;
         for (const tool of await api(`/mcp/servers/${server.id}/tools`)) {
-          if (tool.enabled) tools.push(tool);
+          // Keep the owning server so rows can be grouped by source, and so a row
+          // can disable its tool in place.
+          if (tool.enabled) {
+            tools.push({ ...tool, server_id: server.id, server_name: server.name });
+          }
         }
       }
       state.toolCache = tools;
@@ -853,21 +869,55 @@ async function refreshInspector() {
   }
   const tools = state.toolCache || [];
   toolHost.innerHTML = "";
+  $("toolCount").textContent = tools.length ? String(tools.length) : "";
   if (!tools.length) {
     toolHost.innerHTML = '<p class="hint">None enabled. Open Settings → MCP.</p>';
   } else {
-    for (const tool of tools) {
-      const row = document.createElement("div");
-      row.className = "row";
-      row.innerHTML = `<code>${escapeHtml(tool.namespaced_name)}</code><span class="spacer"></span>
-        <span class="tag" data-risk="${escapeHtml(tool.risk)}">${escapeHtml(tool.risk)}</span>`;
-      toolHost.appendChild(row);
+    // Grouped by source server, in the order the registry lists them, so the panel
+    // mirrors Settings → MCP and it is obvious what came from where.
+    for (const [serverName, group] of groupByServer(tools)) {
+      const block = document.createElement("div");
+      block.className = "tool-group";
+      block.setAttribute("role", "group");
+      block.setAttribute("aria-label", `${serverName}, ${group.length} enabled`);
+      const head = document.createElement("div");
+      head.className = "insp-subhead";
+      head.innerHTML = `<span>${escapeHtml(serverName)}</span><span class="num">${group.length}</span>`;
+      block.appendChild(head);
+      for (const tool of group) {
+        const row = document.createElement("div");
+        row.className = "row";
+        const name = document.createElement("code");
+        // The server is the group heading now, so the row shows only the tool name.
+        name.textContent = tool.namespaced_name.startsWith(`${serverName}__`)
+          ? tool.namespaced_name.slice(serverName.length + 2)
+          : tool.namespaced_name;
+        const spacer = document.createElement("span");
+        spacer.className = "spacer";
+        const risk = document.createElement("span");
+        risk.className = "tag";
+        risk.dataset.risk = tool.risk;
+        risk.textContent = tool.risk;
+        const off = document.createElement("button");
+        off.type = "button";
+        off.className = "btn btn-quiet btn-icon";
+        off.innerHTML = icon("power");
+        off.setAttribute("aria-label", `Disable ${tool.namespaced_name}`);
+        off.title = "Disable";
+        off.addEventListener("click", () => {
+          disableTool(tool).catch((err) => toast(err.message, "error"));
+        });
+        row.append(name, spacer, risk, off);
+        block.appendChild(row);
+      }
+      toolHost.appendChild(block);
     }
   }
 
   const fileHost = $("fileList");
   if (!state.currentId) {
     fileHost.innerHTML = '<p class="hint">No session open.</p>';
+    $("downloadAllBtn").hidden = true;
     return;
   }
   showLoading(fileHost, "Reading workspace…");
@@ -875,6 +925,7 @@ async function refreshInspector() {
     const listing = await api(`/conversations/${state.currentId}/workspace`);
     clearLoading(fileHost);
     fileHost.innerHTML = "";
+    $("downloadAllBtn").hidden = !listing.files.length;
     if (!listing.files.length) {
       fileHost.innerHTML = '<p class="hint">Workspace is empty.</p>';
     } else {
@@ -893,7 +944,41 @@ async function refreshInspector() {
     }
   } catch (_) {
     clearLoading(fileHost);
+    $("downloadAllBtn").hidden = true;
     fileHost.innerHTML = '<p class="hint">Workspace unavailable.</p>';
+  }
+}
+
+async function disableTool(tool) {
+  await api(`/mcp/servers/${tool.server_id}/tools/${encodeURIComponent(tool.name)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled: false }),
+  });
+  state.toolsDirty = true;
+  await refreshInspector();
+  if (!$("settingsDialog").hidden) await refreshPanel();
+  toast(`${tool.namespaced_name} disabled.`);
+}
+
+async function downloadAllFiles() {
+  if (!state.currentId) return;
+  try {
+    const response = await fetch(`/conversations/${state.currentId}/workspace/download-all`);
+    if (!response.ok) {
+      let detail = `Couldn’t download the workspace (HTTP ${response.status}).`;
+      try {
+        detail = (await response.json()).detail || detail;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `workspace-${state.currentId.slice(0, 8)}.zip`;
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    toast(err.message, "error");
   }
 }
 
@@ -1688,6 +1773,10 @@ function wire() {
   $("inspectorToggle").addEventListener("click", () => toggleDrawer("inspector"));
   $("drawerScrim").addEventListener("click", closeDrawerAndRestore);
   $("settingsBtn").addEventListener("click", openSettings);
+  $("workspaceSettingsBtn").addEventListener("click", openSettings);
+  $("downloadAllBtn").addEventListener("click", () => {
+    downloadAllFiles().catch((err) => toast(err.message, "error"));
+  });
   $("closeDialogBtn").addEventListener("click", closeSettings);
   $("settingsScrim").addEventListener("click", closeSettings);
   $("cancelDeleteBtn").addEventListener("click", closeDeleteDialog);
@@ -1839,8 +1928,13 @@ function wire() {
 async function init() {
   const theme = localStorage.getItem("toolloom.theme") || "light";
   applyTheme(theme);
-  const motion = localStorage.getItem("toolloom.motion") === "reduced";
-  $("motionToggle").checked = motion;
+  const stored = localStorage.getItem("toolloom.motion");
+  // The OS preference is honoured by CSS on its own; the toggle forces reduced
+  // motion on top of it, so reflect the effective state when nothing is stored.
+  const motion =
+    stored === "reduced" ||
+    (stored === null && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
+  $("motionToggle").checked = Boolean(motion);
   document.documentElement.dataset.motion = motion ? "reduced" : "full";
 
   wire();

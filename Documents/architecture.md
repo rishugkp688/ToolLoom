@@ -498,8 +498,20 @@ frames; tool activity is grouped per turn and stays collapsed until opened, and
 the final answer remains separate from the commentary around it. Markdown is
 rendered by a small local module, and rendered text is escaped first.
 
-Browser preferences (theme, model, motion) are stored locally. Transcript, usage,
-tool execution, workspace files and credentials stay backend-owned.
+The details panel lists the enabled tools and the workspace files. Both sections
+are collapsed disclosures, and either can be acted on in place: a tool can be
+disabled from its row, and the whole workspace downloads as a zip rather than one
+file at a time. Tools are grouped by the server they came from — `sandbox`,
+`generated`, or one of your own connections — so the panel mirrors Settings → MCP
+and the origin of each capability is visible at a glance. The rail's workspace
+block doubles as the settings entry point, which is where operators expect to
+find it.
+
+Browser preferences (theme, model, motion) are stored locally. The motion switch
+forces reduced motion on top of the `prefers-reduced-motion` media query, which
+CSS already honours on its own; when nothing is stored the switch reflects the
+operating system's setting. Transcript, usage, tool execution, workspace files and
+credentials stay backend-owned.
 
 ## 16. Testing
 
@@ -520,6 +532,12 @@ container.
   cancellation, orphan repair, compaction and resume.
 - API tests cover invalid input, missing ids, origin and host enforcement, and
   the concurrency limits.
+- Frontend assets are checked statically, because there is no build step to catch
+  the mistakes that fail silently in a browser: every `var(--x)` in the stylesheet
+  must be defined, every element id the script reaches for must exist, every icon
+  name must have a path, the markup must be balanced, and the tab/panel wiring must
+  agree in both directions. Each of these was verified by mutation — reintroducing
+  the bug makes the corresponding check fail.
 
 Live checks that need a key, a browser or a paid call are opt-in and are not part
 of the default run. They use temporary databases, so they never touch your
