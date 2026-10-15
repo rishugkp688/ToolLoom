@@ -10,6 +10,9 @@ browser is a thin client over REST and server-sent events. The backend is the
 only process that talks to a model or to an MCP server, and the only place
 credentials live.
 
+This is a personal project for learning right now, let's see what the future holds.
+Support for Local Models is planned for future release.
+
 ![ToolLoom](Images/main_page_img.png)
 
 ## What it does
