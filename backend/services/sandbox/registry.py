@@ -26,8 +26,11 @@ from pydantic import ValidationError
 from backend.services.sandbox import foundry_tools, fs_tool, http_tool, search_tool
 from backend.services.sandbox.workspace import Workspace, workspace_for
 from backend.services.skills import read_skill_body
+from backend.services.task_service import PLAN_STATUSES
 from backend.services.tool_foundry import authoring
 from backend.services.tool_foundry.manifest import FoundryError
+
+MAX_PLAN_STEPS = 50
 
 
 class SandboxError(RuntimeError):
@@ -47,6 +50,9 @@ class ToolContext:
     # The tool registry, for the rare tool that changes the catalogue: installing
     # a generated capability must make it visible without a restart.
     registry: Any = None
+    # Durable task state (objective, plan, completion criteria). The plan tools read
+    # and revise it; the runtime pins it into the system prompt.
+    tasks: Any = None
 
     def workspace(self) -> Workspace:
         return workspace_for(self.workspaces_dir, self.conversation_id)
@@ -62,6 +68,27 @@ class SandboxTool:
     input_schema: dict[str, Any]
     handler: Handler
     risk: str = "low"
+
+
+# How our own tools affect the world. This is our classification, not a tool's
+# self-description: anything absent stays `unknown`, which keeps it sequential and
+# blocks blind retries after an uncertain outcome.
+EFFECTS: dict[str, str] = {
+    "sandbox__fs_read": "read_only",
+    "sandbox__fs_list": "read_only",
+    "sandbox__fs_grep": "read_only",
+    "sandbox__skill_list": "read_only",
+    "sandbox__skill_read": "read_only",
+    "sandbox__plan_read": "read_only",
+    "sandbox__plan_write": "idempotent",
+    "sandbox__fs_write": "mutating",
+    "sandbox__fs_delete": "mutating",
+    "sandbox__http_fetch": "idempotent",
+    "sandbox__web_search": "idempotent",
+    "demo__add": "read_only",
+    # python, shell and the foundry tools stay unknown: they execute arbitrary code,
+    # so repeating one after an uncertain outcome is exactly what must not happen.
+}
 
 
 # --- demo --------------------------------------------------------------------
@@ -108,6 +135,74 @@ def _web_search(arguments: dict[str, Any], ctx: ToolContext) -> str:
     return search_tool.search(arguments, ctx)
 
 
+# --- task state --------------------------------------------------------------
+
+
+def _plan_read(arguments: dict[str, Any], ctx: ToolContext) -> str:
+    if ctx.tasks is None:
+        raise SandboxError("task state is unavailable in this build")
+    task = ctx.tasks.active(ctx.conversation_id)
+    if task is None:
+        return json.dumps({"objective": None, "plan": [], "plan_revision": 0}, indent=2)
+    return json.dumps(
+        {
+            "original_request": task.original_request,
+            "objective": task.objective,
+            "objective_revision": task.objective_revision,
+            "completion_criteria": task.completion_criteria,
+            "plan": ctx.tasks.plan_of(task),
+            "plan_revision": task.plan_revision,
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _plan_write(arguments: dict[str, Any], ctx: ToolContext) -> str:
+    if ctx.tasks is None:
+        raise SandboxError("task state is unavailable in this build")
+    objective = arguments.get("objective")
+    criteria = arguments.get("completion_criteria")
+    raw_plan = arguments.get("plan")
+    if objective is None and criteria is None and raw_plan is None:
+        raise SandboxError("provide at least one of `plan`, `objective`, `completion_criteria`")
+
+    plan = None
+    if raw_plan is not None:
+        if not isinstance(raw_plan, list) or len(raw_plan) > MAX_PLAN_STEPS:
+            raise SandboxError(f"plan must be a list of at most {MAX_PLAN_STEPS} steps")
+        plan = []
+        for index, item in enumerate(raw_plan, start=1):
+            if not isinstance(item, dict):
+                raise SandboxError(f"plan step {index} must be an object")
+            step = str(item.get("step") or "").strip()
+            status = str(item.get("status") or "pending")
+            if not step:
+                raise SandboxError(f"plan step {index} needs a non-empty `step`")
+            if status not in PLAN_STATUSES:
+                raise SandboxError(
+                    f"plan step {index} status must be one of {', '.join(PLAN_STATUSES)}"
+                )
+            plan.append({"step": step[:500], "status": status})
+
+    task = ctx.tasks.revise(
+        ctx.conversation_id,
+        objective=objective,
+        plan=plan,
+        completion_criteria=criteria,
+    )
+    ctx.tasks.project_plan(ctx.workspace(), ctx.conversation_id)
+    return json.dumps(
+        {
+            "objective_revision": task.objective_revision,
+            "plan_revision": task.plan_revision,
+            "plan": ctx.tasks.plan_of(task),
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
 # --- tool foundry ------------------------------------------------------------
 
 def _foundry_scaffold(arguments: dict[str, Any], ctx: ToolContext) -> str:
@@ -131,6 +226,10 @@ def _foundry_async_only(arguments: dict[str, Any], ctx: ToolContext) -> str:
 
 def _python_async_only(arguments: dict[str, Any], ctx: ToolContext) -> str:
     raise SandboxError("Python requires the async execution dispatcher")
+
+
+def _shell_async_only(arguments: dict[str, Any], ctx: ToolContext) -> str:
+    raise SandboxError("Shell execution requires the async dispatcher")
 
 
 # --- skills ------------------------------------------------------------------
@@ -172,6 +271,50 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
     ],
     "sandbox": [
         SandboxTool(
+            name="plan_read",
+            description=(
+                "Read the current task objective and plan. Check it before changing "
+                "direction so you do not overwrite newer progress."
+            ),
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            handler=_plan_read,
+        ),
+        SandboxTool(
+            name="plan_write",
+            description=(
+                "Replace the task plan, objective or completion criteria. The plan is "
+                "pinned outside summarisation, so it survives however long the run gets. "
+                "Keep it current as you work: mark steps in_progress or completed, and add "
+                "steps you discover. The original request is immutable and is never "
+                "overwritten; each change bumps that field's revision."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "objective": {"type": "string", "maxLength": 2000},
+                    "plan": {
+                        "type": "array",
+                        "maxItems": MAX_PLAN_STEPS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": {"type": "string", "minLength": 1, "maxLength": 500},
+                                "status": {
+                                    "type": "string",
+                                    "enum": list(PLAN_STATUSES),
+                                },
+                            },
+                            "required": ["step"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "completion_criteria": {"type": "string", "maxLength": 1000},
+                },
+                "additionalProperties": False,
+            },
+            handler=_plan_write,
+        ),
+        SandboxTool(
             name="python",
             description=(
                 "Run Python in the conversation workspace. Executes with host OS "
@@ -188,6 +331,35 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
                 "additionalProperties": False,
             },
             handler=_python_async_only,
+            risk="high",
+        ),
+        SandboxTool(
+            name="shell",
+            description=(
+                "Run a shell command and read its output. This is the verification "
+                "tool: prefer it for running the test suite, a build, a linter or "
+                "a formatter check after you change files, so you can see whether "
+                "your work actually passes. Runs through a real shell with host OS "
+                "permissions, NOT sandboxed, so use the narrowest command that "
+                "answers the question and pass non-interactive flags. A pipeline "
+                "reports the first failing command's status, so `tests | tail` still "
+                "tells you the tests failed. The default working directory is the "
+                "conversation workspace. Requires operator opt-in and approval."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "minLength": 1, "maxLength": 8000},
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory; defaults to the workspace",
+                    },
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600},
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+            handler=_shell_async_only,
             risk="high",
         ),
         SandboxTool(
@@ -390,6 +562,13 @@ def available_local_servers() -> list[str]:
 
 def tools_for(server_name: str) -> list[SandboxTool]:
     return list(LOCAL_SERVERS.get(server_name, []))
+
+
+def effects_for(server_name: str) -> dict[str, str]:
+    return {
+        tool.name: EFFECTS.get(f"{server_name}__{tool.name}", "unknown")
+        for tool in LOCAL_SERVERS.get(server_name, [])
+    }
 
 
 def get_tool(server_name: str, tool_name: str) -> SandboxTool | None:

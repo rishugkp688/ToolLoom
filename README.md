@@ -60,6 +60,20 @@ compaction and interruptions are persisted. Reload a conversation and you see
 what actually ran, including failures and refusals. There are no invented tool
 results.
 
+**Survives long work.** A task holds the objective and a versioned plan; a run
+records one attempt at it; a tool attempt records one dispatch and its outcome.
+Those rows are written before a call is made, so a crash leaves evidence instead of
+a gap. On the next start an unfinished run is marked interrupted and an unfinished
+call becomes *unknown*; a resume then tells the model what already completed and
+what it must check rather than redo. A call with an unknown outcome is refused if
+it would be repeated identically, unless the tool is classified read-only.
+
+**Degrades instead of dying.** When the prompt no longer fits, history is reduced in
+cost order: old tool results are pruned, then older exchanges are summarised, then
+the oldest are dropped — never the newest. The objective and plan live in the system
+prompt, so summarisation cannot remove them. Only an irreducible input (the newest
+message plus the system prompt and tools exceeding the window) fails, and it says so.
+
 ## Quick start
 
 ```bash
@@ -77,7 +91,7 @@ uv run uvicorn backend.main:create_app --factory --host 127.0.0.1 --port 8000
 
 Open <http://127.0.0.1:8000>.
 
-Run the test suite with no key and no network:
+From a full local checkout, run the suite with no key and no network:
 
 ```bash
 uv run pytest -q
@@ -108,19 +122,30 @@ sensitive is committed.
 | `COMMANDCODE_API_KEY` | none | Your key. Server-side only, never sent to the browser |
 | `COMMANDCODE_MODEL` | `deepseek/deepseek-v4-flash` | Model id, or pick one from the `/models` catalogue in the UI |
 | `COMMANDCODE_API_STYLE` | `openai` | `openai`, `anthropic`, or `auto` to route Claude models to `/messages` |
+| `MODEL_MAX_OUTPUT_TOKENS` | auto | Hard cap per turn; blank derives it from the window |
 | `MODEL_CONTEXT_WINDOW` | auto | Optional smaller local cap. Blank uses the provider's catalogue |
 | `TOOLLOOM_RUN_TIMEOUT_SECONDS` | `300` | Total deadline for one agent run |
-| `TOOLLOOM_MAX_ITERATIONS` | `12` | Model turns per run, unless Unlimited steps is on |
+| `TOOLLOOM_MAX_ITERATIONS` | `100` | Model turns per run, unless Unlimited steps is on |
+| `TOOLLOOM_MAX_OUTPUT_CONTINUATIONS` | `3` | Times a run may continue a reply cut off at the output limit; `0` disables it |
 | `TOOLLOOM_SEARCH_PROVIDER` | `duckduckgo` | `duckduckgo`, `wikipedia`, or `searxng` with `TOOLLOOM_SEARCH_URL` |
 | `TOOLLOOM_ALLOW_PYTHON` | `0` | Enables the `python` tool. Read the warning below first |
+| `TOOLLOOM_ALLOW_SHELL` | `0` | Enables the `shell` tool. Read the warning below first |
 | `TOOLLOOM_ALLOW_FOUNDRY` | `0` | Enables the Tool Foundry authoring tools, which run generated tests |
 | `TOOLLOOM_ALLOW_STDIO` | `0` | Allows operator-configured local MCP commands |
 
 ## Tools
 
 **Built-in `sandbox` server.** `fs_read`, `fs_write`, `fs_list`, `fs_grep`,
-`fs_delete`, `http_fetch`, `web_search`, `python`, `skill_list`, `skill_read`, and
-the Tool Foundry tools `foundry_scaffold`, `foundry_validate`, `foundry_install`.
+`fs_delete`, `http_fetch`, `web_search`, `python`, `shell`, `skill_list`,
+`skill_read`, and the Tool Foundry tools `foundry_scaffold`, `foundry_validate`,
+`foundry_install`.
+
+**`shell` is the verification tool.** Running a test suite, a build or a linter is
+what turns "I wrote it" into "it works". It is a real shell — pipes, `&&`,
+substitution — bounded by a wall-clock timeout and an output cap, with the whole
+process tree killed on expiry and the child given a minimal environment rather
+than yours, so provider keys cannot leak into a command. It ships disabled and
+needs `TOOLLOOM_ALLOW_SHELL=1` plus approval.
 
 **Web search** returns ranked titles, URLs and snippets so the model can read a
 result properly with `http_fetch` instead of guessing URLs. No provider needs an
@@ -189,6 +214,12 @@ This is a single-user local tool. It is honest about where the boundary is.
 - `python` runs as your user with your filesystem and network access. The
   workspace is the working directory, not a jail. It is **not OS-isolated**.
   Leave it off unless you trust the workload.
+- `shell` is the same posture, through a real shell: it is how the agent verifies
+  its own work (run the tests, read the failure, fix it), which is what makes
+  "done" checkable rather than merely claimed. It runs as your user, and its
+  `cwd` may point outside the workspace, because a command could `cd` there
+  regardless — restricting the argument would be a false guarantee, not a
+  boundary. Leave it off unless you trust the workload.
 - A capability is code you approved, and it runs with the same limits and the same
   lack of isolation. Validation executes the generated tests, which is why
   `TOOLLOOM_ALLOW_FOUNDRY` defaults to `0`, why installing needs approval, and why

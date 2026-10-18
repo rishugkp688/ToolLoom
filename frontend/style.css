@@ -95,6 +95,13 @@ kbd { font: 10px var(--ui); opacity: .8; margin-left: auto; }
 .insp-details[open] > summary svg { transform: rotate(90deg); }
 .insp-details > *:not(summary) { margin-top: var(--s3); }
 .insp-title-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* Task state: the objective and plan are durable, so show them as such. */
+.task-objective { font-size: var(--t-sm); color: var(--ink); line-height: 1.55; }
+.plan { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--s2); }
+.plan li { display: flex; align-items: baseline; gap: var(--s2); font-size: var(--t-sm); color: var(--ink-2); }
+.plan .tag { flex: none; }
+.plan .tag[data-status="completed"] { color: var(--pass); }
+.plan .tag[data-status="in_progress"] { color: var(--signal); }
 /* Tools are grouped by the server they came from. */
 .tool-group { display: flex; flex-direction: column; gap: var(--s2); }
 .tool-group + .tool-group { margin-top: var(--s4); }

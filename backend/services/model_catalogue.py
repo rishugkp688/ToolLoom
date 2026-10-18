@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from backend.services.providers.base import ModelInfo
 
 FALLBACK_CONTEXT_WINDOW = 32_768  # a local budget, never advertised as model metadata
+# Ceiling for the derived output allowance. Half the window leaves the other half for
+# the prompt, which is generous for an agent that writes files but still bounded.
+ADAPTIVE_OUTPUT_CEILING = 32_768
 
 
 @dataclass(frozen=True)
@@ -35,7 +38,14 @@ def budget_for(settings, info: ModelInfo | None = None) -> ModelBudget:
         window, source = (
             (reported, "provider") if reported else (FALLBACK_CONTEXT_WINDOW, "fallback")
         )
-    output = min(settings.model_max_output_tokens, max(1, window // 4))
+    # An explicit setting is a hard cap the operator chose. Blank means adaptive:
+    # take half the window, up to a ceiling. A fixed number cannot be right for both
+    # a reasoning model that spends its budget thinking and a model that answers
+    # directly, and guessing one is what made a normal turn stop with no output.
+    if settings.model_max_output_tokens:
+        output = min(settings.model_max_output_tokens, max(1, window - 64))
+    else:
+        output = min(ADAPTIVE_OUTPUT_CEILING, max(1, window // 2))
     return ModelBudget(window, output, source)
 
 

@@ -22,6 +22,7 @@ VALID_SEARCH_PROVIDERS = {"duckduckgo", "wikipedia", "searxng"}
 _BLANK_AS_NONE = (
     "commandcode_api_key",
     "model_context_window",
+    "model_max_output_tokens",
     "toolloom_secrets_key",
     "toolloom_data_dir",
     "toolloom_price_input_per_1k",
@@ -61,15 +62,19 @@ class Settings(BaseSettings):
     commandcode_zdr: int = 0
 
     # Model budgeting
-    model_max_output_tokens: int = Field(default=4096, ge=1)
+    # Hard cap on one turn's output. Blank means adaptive: derive it from the model's
+    # context window instead, so the operator does not have to guess a number that is
+    # large enough for reasoning models yet small enough to leave room for the prompt.
+    model_max_output_tokens: int | None = Field(default=None, ge=1)
     model_context_window: int | None = Field(default=None, ge=512)
     toolloom_auto_titles: bool = True
 
-    # Agent loop ceilings
-    toolloom_max_iterations: int = 12
-    toolloom_max_tool_calls: int = 40
-    toolloom_max_parallel_tools: int = 4
-    toolloom_max_payload_bytes: int = 200_000
+    # Coding work is many turns of edit/run/read, not a chat exchange. These were
+    # tuned for a cautious MVP and stopped ordinary tasks; the time limit is the real
+    # bound, and the count caps exist only to stop a runaway loop.
+    toolloom_max_iterations: int = 100
+    toolloom_max_output_continuations: int = Field(default=3, ge=0, le=20)
+    toolloom_max_tool_calls: int = 300
 
     # Server bind (local only by default)
     toolloom_host: str = "127.0.0.1"
@@ -86,7 +91,7 @@ class Settings(BaseSettings):
     toolloom_allow_python: bool = False
     toolloom_python_timeout_seconds: int = Field(default=15, ge=1, le=120)
     toolloom_python_output_bytes: int = Field(default=64_000, ge=1024, le=1_000_000)
-    toolloom_run_timeout_seconds: int = Field(default=300, ge=1, le=1800)
+    toolloom_run_timeout_seconds: int = Field(default=1800, ge=1, le=7200)
 
     # Test/load-harness fixture only: seeds the synthetic `demo` local server
     # (demo__add). Not enabled for a normal installation, which ships `sandbox`.
@@ -110,6 +115,13 @@ class Settings(BaseSettings):
     toolloom_foundry_timeout_seconds: int = Field(default=30, ge=1, le=600)
     toolloom_foundry_test_timeout_seconds: int = Field(default=60, ge=1, le=600)
     toolloom_foundry_output_bytes: int = Field(default=64_000, ge=1_024, le=1_000_000)
+
+    # Shell execution: the verification primitive. Commands run through a real
+    # shell as the operator and are NOT OS-isolated, so this is off by default.
+    # The default timeout is generous because test suites are slow.
+    toolloom_allow_shell: bool = False
+    toolloom_shell_timeout_seconds: int = Field(default=120, ge=1, le=600)
+    toolloom_shell_output_bytes: int = Field(default=64_000, ge=1_024, le=1_000_000)
 
     @property
     def data_dir(self) -> Path:

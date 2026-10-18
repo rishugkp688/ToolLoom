@@ -23,7 +23,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from backend.services.tool_foundry.manifest import (
-    MANIFEST_FILENAME,
     FoundryError,
     FoundryManifest,
     load_manifest,
@@ -61,10 +60,15 @@ class InstalledPackage:
     directory: Path
     manifest: FoundryManifest
     entrypoint: Path
-    # The hash recorded at install time. This is the approved hash.
+    # The entrypoint hash, shown in the review view.
     sha256: str
     # The hash of the file as it is right now.
     actual_sha256: str
+    # A digest over every regular file in the package. This is what approval is
+    # bound to, because the entrypoint alone does not describe what a package does:
+    # an imported helper, a resource file or the manifest can change behaviour
+    # without touching the file the operator reviewed.
+    digest: str
     installed_at: str | None
     source_conversation: str | None
     tests_passed: int | None
@@ -83,6 +87,31 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def package_digest(directory: Path) -> str:
+    """A canonical digest over every regular file in a package.
+
+    Covers helpers, resources and the manifest, not just the entrypoint, because
+    those change what a tool does without changing the file that was reviewed.
+    Symlinks are refused rather than followed so a link cannot point the digest at
+    content outside the package, and the integrity record itself is excluded.
+    """
+    root = Path(directory)
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if relative == INTEGRITY_FILENAME or relative.startswith("__pycache__/"):
+            continue
+        if path.is_symlink():
+            raise FoundryError(f"refusing to digest a symlink: {relative}")
+        if not path.is_file() or relative.endswith(".pyc"):
+            continue
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_hash_file(path).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _read_integrity(directory: Path) -> dict:
     path = directory / INTEGRITY_FILENAME
     if not path.is_file():
@@ -98,20 +127,32 @@ def _load(directory: Path) -> InstalledPackage:
     manifest = load_manifest(directory)
     entrypoint = (directory / manifest.entrypoint).resolve()
     integrity = _read_integrity(directory)
-    recorded = str(integrity.get("sha256") or "")
-    actual = _hash_file(entrypoint) if entrypoint.is_file() else ""
+    recorded_entry = str(integrity.get("sha256") or "")
+    recorded_digest = str(integrity.get("digest") or "")
+    actual_entry = _hash_file(entrypoint) if entrypoint.is_file() else ""
+    try:
+        actual_digest = package_digest(directory)
+    except FoundryError:
+        actual_digest = ""
+    if recorded_digest:
+        integrity_ok = recorded_digest == actual_digest and bool(actual_digest)
+    else:
+        # Packages installed before package digests existed can only be checked
+        # against their entrypoint. They are reported as they are, not re-blessed.
+        integrity_ok = bool(recorded_entry) and recorded_entry == actual_entry
     return InstalledPackage(
         name=manifest.name,
         version=manifest.version,
         directory=directory,
         manifest=manifest,
         entrypoint=entrypoint,
-        sha256=recorded,
-        actual_sha256=actual,
+        sha256=recorded_entry,
+        actual_sha256=actual_entry,
+        digest=recorded_digest,
         installed_at=integrity.get("installed_at"),
         source_conversation=integrity.get("source_conversation"),
         tests_passed=integrity.get("tests_passed"),
-        integrity_ok=bool(recorded) and recorded == actual,
+        integrity_ok=integrity_ok,
     )
 
 
@@ -145,7 +186,9 @@ def install_package(
 
     integrity = {
         "sha256": _hash_file(entrypoint),
-        "manifest_sha256": _hash_file(staging / MANIFEST_FILENAME),
+        # The manifest is inside this digest, so a separate manifest hash would be
+        # a value nothing checks. One digest, checked in one place.
+        "digest": package_digest(staging),
         "installed_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "source_conversation": source_conversation,
         "tests_passed": tests_passed,
@@ -154,18 +197,40 @@ def install_package(
         json.dumps(integrity, indent=2) + "\n", encoding="utf-8"
     )
 
-    # Replace the whole name directory so only one version is ever active, and
-    # swap via rename so a failure cannot leave a half-installed version behind.
+    # Publish the new version first, then retire superseded ones. The previous
+    # versions are parked rather than deleted, so a failure while publishing restores
+    # what was working instead of leaving the capability gone.
     name_dir = (root / manifest.name).resolve()
     if root.resolve() not in name_dir.parents:
         shutil.rmtree(staging, ignore_errors=True)
         raise FoundryError("refusing to install outside the tools directory")
-    if name_dir.exists():
-        shutil.rmtree(name_dir, ignore_errors=True)
     name_dir.mkdir(parents=True, exist_ok=True)
-    staging.rename(target)
 
-    return _load(target)
+    retired = name_dir / ".previous"
+    if retired.exists():
+        shutil.rmtree(retired, ignore_errors=True)
+    superseded = [path for path in name_dir.iterdir() if path != retired]
+    if superseded:
+        retired.mkdir()
+        for old in superseded:
+            old.rename(retired / old.name)
+
+    try:
+        staging.rename(target)
+        published = _load(target)
+        if not published.integrity_ok:
+            raise FoundryError("the published package failed its integrity check")
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        if retired.exists():
+            for old in retired.iterdir():
+                old.rename(name_dir / old.name)
+            retired.rmdir()
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    shutil.rmtree(retired, ignore_errors=True)
+    return published
 
 
 def list_installed(settings) -> list[InstalledPackage]:
@@ -175,6 +240,8 @@ def list_installed(settings) -> list[InstalledPackage]:
         if name_dir.name.startswith("."):
             continue  # staging leftovers
         for version_dir in sorted(p for p in name_dir.iterdir() if p.is_dir()):
+            if version_dir.name.startswith("."):
+                continue  # `.previous` while an install is in flight
             try:
                 packages.append(_load(version_dir))
             except FoundryError:
@@ -192,7 +259,17 @@ def find_installed(settings, name: str) -> InstalledPackage | None:
 
 
 def verify_integrity(package: InstalledPackage) -> bool:
-    """Compare the file against the hash recorded when it was approved."""
+    """Compare the package against the digest recorded when it was installed.
+
+    Checks every file, so a changed helper or manifest fails as loudly as a changed
+    entrypoint. Falls back to the entrypoint hash only for packages installed
+    before package digests existed.
+    """
+    if package.digest:
+        try:
+            return package_digest(package.directory) == package.digest
+        except FoundryError:
+            return False
     if not package.entrypoint.is_file() or not package.sha256:
         return False
     return _hash_file(package.entrypoint) == package.sha256
@@ -210,23 +287,21 @@ def remove_installed(settings, name: str) -> bool:
 
 
 def read_package_files(package: InstalledPackage, *, limit: int = 100_000) -> dict[str, str]:
-    """Read-only view of a package, for reviewing it before enabling it."""
+    """Read-only view of a package, for reviewing it before enabling it.
+
+    Every readable file is returned, not just the entrypoint and tests: an
+    imported helper is part of what the operator is approving.
+    """
+    root = package.directory
     files: dict[str, str] = {}
-    candidates: list[tuple[str, Path]] = [
-        ("manifest.json", package.directory / MANIFEST_FILENAME),
-        (package.manifest.entrypoint, package.entrypoint),
-    ]
-    tests = package.directory / package.manifest.tests
-    if tests.is_dir():
-        candidates.extend(
-            (f"{package.manifest.tests}/{path.name}", path)
-            for path in sorted(tests.glob("test_*.py"))
-        )
-    for label, path in candidates:
-        if not path.is_file():
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if relative == INTEGRITY_FILENAME or relative.startswith("__pycache__/"):
+            continue
+        if path.is_symlink() or not path.is_file():
             continue
         try:
-            files[label] = path.read_text(encoding="utf-8", errors="replace")[:limit]
+            files[relative] = path.read_text(encoding="utf-8", errors="replace")[:limit]
         except OSError:
             continue
     return files

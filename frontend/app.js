@@ -843,7 +843,79 @@ function groupByServer(tools) {
   return groups;
 }
 
+async function renderTask() {
+  const host = $("taskList");
+  const revision = $("taskRevision");
+  revision.textContent = "";
+  if (!state.currentId) {
+    host.innerHTML = '<p class="hint">No session open.</p>';
+    return;
+  }
+  showLoading(host, "Reading task…");
+  let task = null;
+  let runs = [];
+  try {
+    [task, runs] = await Promise.all([
+      api(`/conversations/${encodeURIComponent(state.currentId)}/task`).then((r) => r.task),
+      api(`/conversations/${encodeURIComponent(state.currentId)}/runs`).then((r) => r.runs || []),
+    ]);
+  } catch (_) {
+    clearLoading(host);
+    host.innerHTML = '<p class="hint">Task state unavailable.</p>';
+    return;
+  }
+  clearLoading(host);
+  host.innerHTML = "";
+  if (!task) {
+    host.innerHTML = '<p class="hint">No task yet. It is created on the first message.</p>';
+    return;
+  }
+
+  revision.textContent = `rev ${task.plan_revision}`;
+
+  const objective = document.createElement("p");
+  objective.className = "task-objective";
+  objective.textContent = task.objective || task.original_request || "Untitled task";
+  host.appendChild(objective);
+
+  if (task.completion_criteria) {
+    const criteria = document.createElement("p");
+    criteria.className = "hint";
+    criteria.textContent = `Done when: ${task.completion_criteria}`;
+    host.appendChild(criteria);
+  }
+
+  if (task.plan && task.plan.length) {
+    const plan = document.createElement("ol");
+    plan.className = "plan";
+    for (const step of task.plan) {
+      const item = document.createElement("li");
+      const status = document.createElement("span");
+      status.className = "tag";
+      status.dataset.status = step.status;
+      status.textContent = step.status;
+      const text = document.createElement("span");
+      text.textContent = step.step;
+      item.append(status, text);
+      plan.appendChild(item);
+    }
+    host.appendChild(plan);
+  } else {
+    host.innerHTML += '<p class="hint">No plan yet.</p>';
+  }
+
+  const last = runs[0];
+  if (last) {
+    const line = document.createElement("p");
+    line.className = "hint";
+    const reason = last.error || last.stop_reason || "";
+    line.textContent = `Last run: ${last.status}${reason ? ` (${reason})` : ""} · ${last.tool_calls} tool call(s)`;
+    host.appendChild(line);
+  }
+}
+
 async function refreshInspector() {
+  await renderTask();
   const toolHost = $("toolList");
   if (state.toolsDirty || !state.toolCache) {
     showLoading(toolHost, "Reading registry…");

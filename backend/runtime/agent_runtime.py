@@ -6,10 +6,15 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 
-from backend.repositories import ConversationRepository, MessageRepository, SettingRepository
+from backend.models.run import CANCELLED, COMPLETED, FAILED, INTERRUPTED
+from backend.repositories import (
+    ConversationRepository,
+    MessageRepository,
+    RunRepository,
+    SettingRepository,
+)
 from backend.runtime.events import (
     COMPACTED,
-    COMPACTING,
     DONE,
     ERROR,
     ITERATION_START,
@@ -23,7 +28,9 @@ from backend.runtime.events import (
 )
 from backend.runtime.observation import ExecutionResult, to_result
 from backend.runtime.step_controller import StepController
-from backend.services.context_builder import ContextBuilder
+from backend.services.attempts import AttemptLedger, arguments_digest
+from backend.services.context_builder import UsageAnchor, anchor_for
+from backend.services.context_policy import ContextPolicy
 from backend.services.providers.base import (
     BaseProvider,
     MessageStopEvent,
@@ -37,6 +44,7 @@ from backend.services.providers.base import (
     UsageEvent,
     blocks_to_dicts,
 )
+from backend.services.task_service import TaskService
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +65,10 @@ class AgentRuntime:
         self.tool_executor = tool_executor
         self.compactor = compactor
         self.model_catalogue = model_catalogue
+        # Durable state lives beside the loop: the task is what the run is *for*, the
+        # ledger is what actually happened, and the policy is what fits the prompt.
+        self.tasks = TaskService(db, settings)
+        self.ledger = AttemptLedger(db)
 
     async def run_stream(
         self, conversation_id: str, *, model_id: str | None = None
@@ -65,6 +77,9 @@ class AgentRuntime:
         model = model_id or self._default_model_id()
         max_iterations = max(1, settings.toolloom_max_iterations)
         max_tool_calls = max(1, settings.toolloom_max_tool_calls)
+        # Configurable, not a constant: how many times a truncated turn may be
+        # continued is a deployment choice, like every other budget here.
+        max_continuations = max(0, settings.toolloom_max_output_continuations)
         with self.db.session() as session:
             unlimited = SettingRepository(session).get().unlimited_tools
 
@@ -77,6 +92,10 @@ class AgentRuntime:
         stop_reason = "end_turn"
         iteration = 0
         tool_calls_made = 0
+        # A turn cut off by the output limit is continued automatically; these track
+        # the accumulated text and how many continuations have been spent.
+        continuation_text = ""
+        continuations = 0
         advisory: str | None = None
         with self.db.session() as session:
             repo = MessageRepository(session)
@@ -87,6 +106,13 @@ class AgentRuntime:
                 if block.get("type") == "tool_use"
             }
 
+        # The task is what this run is for; the run is one attempt at it. Both are
+        # durable, so a stop of any kind leaves a record a resume can read.
+        task = self.tasks.ensure(conversation_id, request=self._first_request(conversation_id))
+        with self.db.session() as session:
+            run_id = RunRepository(session).start(conversation_id, task_id=task.id).id
+        outcome = {"status": INTERRUPTED, "stop_reason": None, "error": "the run did not finish"}
+
         try:
             from backend.services.model_catalogue import budget_for
 
@@ -95,20 +121,18 @@ class AgentRuntime:
                 if self.model_catalogue
                 else budget_for(settings)
             )
-            if self.compactor is not None:
-                yield AgentEvent(COMPACTING, {})
-                try:
-                    if await self.compactor.compact_if_needed(
-                        conversation_id, model_id=model, budget=budget
-                    ):
-                        yield AgentEvent(COMPACTED, {})
-                except Exception:
-                    pass  # compaction is never fatal
+            policy = ContextPolicy(self.db, settings, self.compactor)
+            anchor: UsageAnchor | None = None
 
             advisory = self._resume_advisory(conversation_id)
 
             while True:
                 iteration += 1
+                # Re-render the pinned state every iteration: plan_write can revise the
+                # objective or plan mid-run, and the next provider request must see it.
+                # A changed block also changes the system digest, which invalidates the
+                # token anchor automatically.
+                pinned = self._pinned_state(conversation_id)
                 if not unlimited and iteration > max_iterations:
                     finish_reason = finish_reason or "max_iterations"
                 if finish_reason:
@@ -117,9 +141,18 @@ class AgentRuntime:
                         "Give the user your best answer from existing results, state what remains "
                         "unfinished, and do not request more tools."
                     )
-                built = ContextBuilder(self.db, settings, budget).build(
-                    conversation_id, advisory=advisory
+                built, reduction = await policy.prepare(
+                    conversation_id,
+                    advisory=advisory,
+                    pinned=pinned,
+                    anchor=anchor,
+                    model_id=model,
+                    budget=budget,
                 )
+                if reduction:
+                    # Emitted only when history was actually reduced, so the indicator
+                    # means something rather than announcing a routine check.
+                    yield AgentEvent(COMPACTED, {"reduction": reduction})
                 advisory = None
                 yield AgentEvent(ITERATION_START, {"iteration": iteration})
 
@@ -147,6 +180,11 @@ class AgentRuntime:
                         turn = event.turn
 
                 if turn is None:
+                    outcome = {
+                        "status": FAILED,
+                        "stop_reason": "error",
+                        "error": "provider returned no result",
+                    }
                     self._persist_note(conversation_id, "[provider returned no result]", "error")
                     yield AgentEvent(ERROR, {"message": "provider returned no result"})
                     return
@@ -155,6 +193,11 @@ class AgentRuntime:
                 if len(set(call_ids)) != len(call_ids) or any(
                     not cid or cid in seen_call_ids for cid in call_ids
                 ):
+                    outcome = {
+                        "status": FAILED,
+                        "stop_reason": "error",
+                        "error": "provider reused a tool-call ID",
+                    }
                     self._persist_note(
                         conversation_id, "[stopped: duplicate tool-call ID]", "error"
                     )
@@ -170,11 +213,30 @@ class AgentRuntime:
                 partial_text = ""
                 total_usage.input_tokens += turn.usage.input_tokens
                 total_usage.output_tokens += turn.usage.output_tokens
-                if turn.text:
-                    reply = turn.text
-                    controller.note_text()
+                if turn.usage.input_tokens:
+                    # The provider's own count for the prompt we just sent is a far
+                    # better basis than a character estimate for deciding what to prune.
+                    anchor = anchor_for(
+                        built.messages, built.system, built.tools, turn.usage.input_tokens
+                    )
                 stop_reason = turn.stop_reason
+                if turn.text:
+                    controller.note_text()
+                    if stop_reason == "max_tokens":
+                        # Hold this slice until the continuation finishes; updating the
+                        # reply here would make each slice overwrite the previous one.
+                        continuation_text += turn.text
+                    else:
+                        reply = (
+                            continuation_text + turn.text if continuation_text else turn.text
+                        )
+                        continuation_text = ""
                 if stop_reason == "error":
+                    outcome = {
+                        "status": FAILED,
+                        "stop_reason": "error",
+                        "error": "provider stream ended without a complete response",
+                    }
                     yield AgentEvent(
                         ERROR,
                         {
@@ -203,6 +265,61 @@ class AgentRuntime:
                             conversation_id, "[stopped: tool execution limit]", stop_reason
                         )
                     break
+                if stop_reason == "max_tokens":
+                    # The provider cut the turn off mid-output. A truncated answer is not
+                    # a finished one, so the run continues instead of ending and making
+                    # the operator click Continue after every file. Any tool call in such
+                    # a turn is refused: its arguments may be truncated while still
+                    # parsing as JSON, which would write a partial file.
+                    for call in turn.tool_calls:
+                        result = to_result(
+                            call,
+                            "Your previous turn was cut off by the output limit, so this "
+                            "call was not executed. Re-issue it with smaller content, for "
+                            "example by writing a file in parts.",
+                            is_error=True,
+                        )
+                        self._persist_tool_result(conversation_id, result)
+                        tool_trace.append(_trace(result))
+                        yield AgentEvent(TOOL_CALL_END, _end_payload(result, iteration))
+
+                    # The slice was accumulated above with the rest of the text.
+                    if not turn.text and not turn.tool_calls:
+                        # A budget consumed entirely (typically by reasoning) produces
+                        # nothing to continue; spending three more turns would repeat
+                        # the same thing. Stop and say what to change.
+                        finish_reason = "max_tokens"
+                        if not reply and not continuation_text:
+                            reply = (
+                                "The model reached its output limit before producing an "
+                                "answer. Raise MODEL_MAX_OUTPUT_TOKENS in .env, or choose a "
+                                "model that spends less of that budget on reasoning."
+                            )
+                        self._persist_note(
+                            conversation_id,
+                            "[stopped: output limit reached before any content]",
+                            "max_tokens",
+                        )
+                        break
+                    continuations += 1
+                    if continuations > max_continuations:
+                        reply = continuation_text or reply
+                        finish_reason = "max_tokens"
+                        self._persist_note(
+                            conversation_id,
+                            "[stopped: output limit reached repeatedly]",
+                            "max_tokens",
+                        )
+                        break
+                    advisory = (
+                        "Your previous message was cut off by the output limit. Continue "
+                        "exactly where you stopped, and keep each tool call small enough to "
+                        "fit — write large files in parts rather than all at once."
+                    )
+                    continue
+
+                # max_tokens was handled above; anything else that is not a complete
+                # tool-use turn is the end of the run.
                 if turn.stop_reason != "tool_use" or not turn.tool_calls:
                     break
 
@@ -213,23 +330,30 @@ class AgentRuntime:
                     for note in controller.note_call(call.name, call.arguments or {}):
                         yield AgentEvent(STEP_NOTE, _note_payload(note))
 
+                    refused = False
                     if exhausted or finish_reason:
                         finish_reason = finish_reason or "max_iterations"
+                        refused = True
                         result = to_result(
                             call,
                             "Tool execution stopped; this call was not executed.",
                             is_error=True,
                         )
                     elif controller.should_refuse(call.name, call.arguments or {}):
-                        finish_reason = "loop_guard"
+                        refused = True
+                        # Refuse this call, not the run. A repeated read is often a
+                        # symptom of context reduction rather than a loop, and ending
+                        # a productive run over it would discard the work. The
+                        # iteration and tool-call budgets already bound the run.
                         result = to_result(
                             call,
-                            f"refused: `{call.name}` repeated identical calls "
-                            "or failed repeatedly this turn",
+                            f"refused: `{call.name}` was called with identical arguments "
+                            "repeatedly, or kept failing. Try a different approach, or "
+                            "answer with what you already have.",
                             is_error=True,
                         )
                     else:
-                        result = await self._execute(call, conversation_id)
+                        result = await self._execute(call, conversation_id, run_id)
 
                     if result.validation_errors:
                         yield AgentEvent(
@@ -245,7 +369,20 @@ class AgentRuntime:
                     tool_trace.append(_trace(result))
                     yield AgentEvent(TOOL_CALL_END, _end_payload(result, iteration))
 
-                    note = controller.note_result(call.name, result.is_error)
+                    # A successful mutating call is progress: repeating an earlier call
+                    # (same test command after an edit) is no longer a duplicate.
+                    changed = (
+                        not result.is_error
+                        and self.tool_executor is not None
+                        and self.tool_executor.effect_of(call.name) == "mutating"
+                    )
+                    note = controller.note_result(
+                        call.name,
+                        result.is_error,
+                        arguments=call.arguments or {},
+                        changed=changed,
+                        refused=refused,
+                    )
                     if note is not None:
                         yield AgentEvent(STEP_NOTE, _note_payload(note))
 
@@ -254,6 +391,7 @@ class AgentRuntime:
                     finish_reason = finish_reason or "max_iterations"
 
             self._touch(conversation_id)
+            outcome = {"status": COMPLETED, "stop_reason": stop_reason, "error": None}
             yield AgentEvent(
                 DONE,
                 {
@@ -264,15 +402,27 @@ class AgentRuntime:
                     "tool_calls": tool_trace,
                 },
             )
+        except GeneratorExit:
+            # Closing the generator (client disconnect, loop shutdown) takes neither of
+            # the branches below, so the partial answer and a stop marker were lost.
+            outcome = {"status": INTERRUPTED, "stop_reason": "cancelled", "error": None}
+            self._record_failure(conversation_id, partial_text, "cancelled")
+            raise
         except asyncio.CancelledError:
+            outcome = {"status": CANCELLED, "stop_reason": "cancelled", "error": None}
             self._record_failure(conversation_id, partial_text, "cancelled")
             raise
         except Exception as exc:  # never leak a raw traceback to the stream
             message = f"{type(exc).__name__}: {exc}"
             if self.tool_executor is not None:
                 message = self.tool_executor._redact(message)
+            outcome = {"status": FAILED, "stop_reason": "error", "error": type(exc).__name__}
             self._record_failure(conversation_id, partial_text, "error")
             yield AgentEvent(ERROR, {"message": message})
+        finally:
+            # Whatever happened — done, error, cancellation or the client vanishing —
+            # the attempt is closed durably. This is what a resume reads.
+            self._finish_run(run_id, outcome, iteration, tool_calls_made, conversation_id)
 
     def _record_failure(self, conversation_id: str, partial_text: str, reason: str) -> None:
         # Saving the failure must never mask cancellation or the original exception.
@@ -294,10 +444,110 @@ class AgentRuntime:
             return model_id
         return self.settings.commandcode_model
 
-    async def _execute(self, call: ToolCallBlock, conversation_id: str) -> ExecutionResult:
+    async def _execute(
+        self, call: ToolCallBlock, conversation_id: str, run_id: str | None = None
+    ) -> ExecutionResult:
         if self.tool_executor is None:
             return to_result(call, "Tools are not available in this build.", is_error=True)
-        return await self.tool_executor.execute(call, conversation_id)
+
+        parse_error = getattr(call, "parse_error", None)
+        if parse_error:
+            # A malformed argument string is the model's mistake to correct, not a
+            # reason to end a run that may already hold a lot of completed work.
+            return to_result(
+                call,
+                f"(invalid arguments) The arguments for `{call.name}` could not be "
+                f"parsed: {parse_error}. Re-issue the same call with one valid JSON "
+                "object.",
+                is_error=True,
+            )
+
+        digest = arguments_digest(call.arguments or {})
+        effect = self.tool_executor.effect_of(call.name)
+
+        # An earlier identical call whose outcome is unknown must not be repeated
+        # blind: the side effect may already have landed. Checked before the ledger is
+        # written, so the ledger only ever records dispatches that were attempted.
+        if run_id is not None and effect != "read_only":
+            prior = self.ledger.uncertain_match(conversation_id, call.name, digest)
+            if prior is not None:
+                return to_result(
+                    call,
+                    f"(refused) An earlier call to `{call.name}` with identical arguments "
+                    f"has an unknown outcome ({prior['status']}): the process stopped before "
+                    "its result was recorded, so the effect may or may not have happened. "
+                    "Check the current state with a read-only tool first, then decide — do "
+                    "not repeat it blindly.",
+                    is_error=True,
+                )
+
+        attempt_id = None
+        if run_id is not None:
+            # Written before dispatch, so a crash leaves evidence that something was
+            # attempted rather than a silent gap.
+            attempt_id = self.ledger.begin(
+                run_id,
+                tool_call_id=call.id,
+                namespaced_name=call.name,
+                arguments_digest=digest,
+                effect=effect,
+            )
+            self.ledger.dispatched(attempt_id)
+
+        result = await self.tool_executor.execute(call, conversation_id)
+
+        if attempt_id is not None:
+            # Recorded independently of the SSE stream, so the outcome survives a
+            # client that vanished mid-flight.
+            self.ledger.settle(
+                attempt_id,
+                is_error=result.is_error,
+                output_text=result.model_text,
+                uncertain=result.outcome_uncertain,
+            )
+        return result
+
+    def _first_request(self, conversation_id: str) -> str:
+        """The user's opening request, for the task's immutable original_request."""
+        with self.db.session() as session:
+            for row in MessageRepository(session).list_by_conversation(conversation_id):
+                text = (row.user_text or row.content or "").strip()
+                if row.role == "user" and text:
+                    return text[:2000]
+        return ""
+
+    def _pinned_state(self, conversation_id: str) -> str:
+        """Task objective, plan and execution state, for the system prompt."""
+        blocks = [
+            self.tasks.render_task_block(conversation_id),
+            self.tasks.render_execution_block(conversation_id, self.ledger),
+        ]
+        return "\n\n".join(block for block in blocks if block)
+
+    def _finish_run(
+        self, run_id: str, outcome: dict, iterations: int, tool_calls: int, conversation_id: str
+    ) -> None:
+        """Close the run record. Never fatal: bookkeeping must not mask the run."""
+        try:
+            with self.db.session() as session:
+                repository = RunRepository(session)
+                run = repository.get(run_id)
+                if run is not None:
+                    repository.finish(
+                        run,
+                        status=outcome["status"],
+                        stop_reason=outcome["stop_reason"],
+                        error=outcome["error"],
+                        iterations=iterations,
+                        tool_calls=tool_calls,
+                    )
+            from backend.services.sandbox.workspace import workspace_for
+
+            self.tasks.project_plan(
+                workspace_for(self.settings.workspaces_dir, conversation_id), conversation_id
+            )
+        except Exception as exc:
+            logger.warning("Could not close the run record (%s: %s)", type(exc).__name__, exc)
 
     def _resume_advisory(self, conversation_id: str) -> str | None:
         """Deterministic starting context when the user resumes a stopped turn."""
@@ -310,6 +560,29 @@ class AgentRuntime:
 
         recent_tools = [row.tool_name for row in rows if row.role == "tool"][-5:]
         lines = ["<resume_context>", "The previous turn was stopped by a budget or truncation."]
+
+        # What the last attempt actually did, so the model resumes from evidence
+        # instead of being told to carry on and guessing what already happened.
+        with self.db.session() as session:
+            previous = RunRepository(session).last_settled(conversation_id)
+        if previous is not None:
+            detail = previous.stop_reason or previous.error or "stopped"
+            lines.append(
+                f"Previous run: {previous.status} after {previous.iterations} "
+                f"iteration(s) ({detail})."
+            )
+        evidence = self.ledger.describe_conversation(conversation_id)
+        if evidence["completed"]:
+            lines.append(
+                "Already completed, do not repeat: "
+                + ", ".join(item["tool"] for item in evidence["completed"])
+            )
+        if evidence["uncertain"]:
+            lines.append(
+                "Outcomes that are unknown and must be checked before repeating: "
+                + ", ".join(f"{item['tool']} ({item['status']})" for item in evidence["uncertain"])
+            )
+
         if recent_tools:
             lines.append("Recent tool calls: " + ", ".join(str(name) for name in recent_tools))
         try:

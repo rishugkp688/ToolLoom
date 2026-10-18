@@ -8,6 +8,7 @@ from backend.services.sandbox.registry import (
     ToolContext,
     available_local_servers,
     dispatch,
+    effects_for,
     server_names,
     tools_for,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "WorkspaceError",
     "available_local_servers",
     "dispatch",
+    "effects_for",
     "server_names",
     "tools_for",
     "workspace_for",

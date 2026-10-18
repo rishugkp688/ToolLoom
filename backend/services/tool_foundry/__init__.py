@@ -27,6 +27,7 @@ from backend.services.tool_foundry.store import (
     install_package,
     installed_root,
     list_installed,
+    package_digest,
     remove_installed,
     verify_integrity,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "installed_root",
     "list_installed",
     "load_manifest",
+    "package_digest",
     "remove_installed",
     "save_manifest",
     "verify_integrity",

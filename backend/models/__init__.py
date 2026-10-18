@@ -3,9 +3,23 @@
 from backend.models.conversation import Conversation
 from backend.models.mcp_server import MCPServer
 from backend.models.message import Message
+from backend.models.run import Run
 from backend.models.secret import Secret
 from backend.models.setting import Setting
 from backend.models.skill import Skill
+from backend.models.task import Task
 from backend.models.tool import Tool
+from backend.models.tool_attempt import ToolAttempt
 
-__all__ = ["Conversation", "MCPServer", "Message", "Secret", "Setting", "Skill", "Tool"]
+__all__ = [
+    "Conversation",
+    "MCPServer",
+    "Message",
+    "Run",
+    "Secret",
+    "Setting",
+    "Skill",
+    "Task",
+    "Tool",
+    "ToolAttempt",
+]

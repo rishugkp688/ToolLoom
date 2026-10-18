@@ -27,6 +27,10 @@ class ExecutionResult:
     duration_ms: int = 0
     validation_errors: list[str] = field(default_factory=list)
     truncated: bool = False
+    # True when the failure happened after dispatch and cannot be proven not to have
+    # taken effect (a timeout, a dropped response, a teardown error). The ledger
+    # records these as "unknown" rather than "failed", so a repeat is not blind.
+    outcome_uncertain: bool = False
 
 
 def truncate_head_tail(

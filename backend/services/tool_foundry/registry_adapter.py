@@ -28,6 +28,11 @@ def discover(settings) -> list[dict[str, Any]]:
             "description": package.manifest.description,
             "input_schema": package.manifest.input_schema,
             "risk": GENERATED_RISK,
+            # Approval is bound to this digest, so replacing the package revokes it.
+            "digest": package.digest,
+            # Generated capabilities run arbitrary code, so they stay unclassified
+            # until an operator says otherwise: sequential, and never blindly retried.
+            "effect": "unknown",
         }
         for package in list_installed(settings)
     ]
@@ -47,6 +52,7 @@ def describe(settings) -> list[dict[str, Any]]:
                 "input_schema": package.manifest.input_schema,
                 "permissions": package.manifest.permissions.model_dump(),
                 "sha256": package.sha256,
+                "digest": package.digest,
                 "integrity_ok": package.integrity_ok,
                 "installed_at": package.installed_at,
                 "source_conversation": package.source_conversation,

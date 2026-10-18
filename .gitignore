@@ -27,12 +27,15 @@ htmlcov/
 
 # Internal material: not published in this repository.
 # These stay in the working tree but are excluded from git, so a fresh clone
-# does not contain them. They are local working notes, not product files.
-# Leading slashes anchor these to the repository root on purpose: an unanchored
-# `tests/` would also ignore backend/tests/.
+# does not contain them. They are local working notes and tests, not product files.
+# Leading slashes anchor these to the repository root on purpose, so a rule for one
+# directory cannot accidentally match a similarly named one elsewhere.
 /Old_Docs/
 /docs/
 /tests/
+# The backend test suite is kept local too: it exercises the runtime against a real
+# database and is not part of the published tree. Run it with `uv run pytest -q`.
+/backend/tests/
 /AGENTS.md
 /BUILD_SPEC.md
 /DECISIONS.md

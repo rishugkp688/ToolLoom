@@ -18,6 +18,7 @@ from backend.services.mcp_client import MCPError, ToolCallOutcome
 from backend.services.mcp_client import call_tool as mcp_call_tool
 from backend.services.mcp_client import list_tools as mcp_list_tools
 from backend.services.sandbox import dispatch as sandbox_dispatch
+from backend.services.sandbox import effects_for as sandbox_effects_for
 from backend.services.sandbox import tools_for as sandbox_tools_for
 
 __all__ = ["MCPConnectionManager", "MCPError", "ToolCallOutcome"]
@@ -32,6 +33,10 @@ def _async_local_handler(server_name: str, tool_name: str):
         return None
     if tool_name == "python":
         from backend.services.sandbox.python_tool import execute
+
+        return execute
+    if tool_name == "shell":
+        from backend.services.sandbox.shell_tool import execute
 
         return execute
     from backend.services.sandbox.foundry_tools import ASYNC_HANDLERS
@@ -55,6 +60,7 @@ class MCPConnectionManager:
     # -- discovery ------------------------------------------------------------
 
     def local_tools(self, server) -> list[dict[str, Any]]:
+        effects = sandbox_effects_for(server.name)
         return [
             {
                 "name": tool.name,
@@ -62,6 +68,7 @@ class MCPConnectionManager:
                 "description": tool.description,
                 "input_schema": tool.input_schema,
                 "risk": tool.risk,
+                "effect": effects.get(tool.name, "unknown"),
             }
             for tool in sandbox_tools_for(server.name)
         ]

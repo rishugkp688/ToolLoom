@@ -80,8 +80,8 @@ async def run_installed(
     if not verify_integrity(package):
         return ToolCallOutcome(
             text=(
-                f"refusing to run {package.tool_name}: the installed file no longer matches the "
-                "hash recorded at approval. Reinstall it or remove it before trying again."
+                f"refusing to run {package.tool_name}: the installed package no longer matches "
+                "the digest recorded at install. Reinstall it or remove it before trying again."
             ),
             is_error=True,
         )

@@ -48,6 +48,26 @@ def _workspace(request: Request, conversation_id: str):
     return workspace_for(request.app.state.settings.workspaces_dir, conversation_id)
 
 
+# Strong references to background metadata tasks, so they are not collected before
+# they finish.
+_TITLE_TASKS: set[asyncio.Task] = set()
+
+
+def _schedule_title(request: Request, conversation_id: str, model_id: str | None) -> None:
+    """Run title generation after the response, without holding the run lock."""
+
+    async def run() -> None:
+        try:
+            await request.app.state.conversation_titles.generate(conversation_id, model_id)
+        except Exception as exc:
+            # Metadata/storage errors here must not turn a saved reply into a failure.
+            logger.warning("Title update failed (%s)", type(exc).__name__)
+
+    task = asyncio.create_task(run())
+    _TITLE_TASKS.add(task)
+    task.add_done_callback(_TITLE_TASKS.discard)
+
+
 def _sse(event: AgentEvent) -> str:
     payload = json.dumps(event.data, default=str)
     return f"event: {event.kind}\ndata: {payload}\n\n"
@@ -123,14 +143,14 @@ async def _events(request, conversation_id, model_id):
             {"message": "Run failed unexpectedly. Retry or check backend storage.", "status": 500},
         )
     if finished is not None:
-        if finished.data.get("stop_reason") == "end_turn":
-            # Title latency/failure must not consume the completed agent run's deadline.
-            try:
-                await request.app.state.conversation_titles.generate(conversation_id, model_id)
-            except Exception as exc:
-                # Metadata/storage errors here must not turn a saved reply into failure.
-                logger.warning("Title update failed (%s)", type(exc).__name__)
+        # The client gets its terminal event first. Title generation is metadata and
+        # can be slow; holding the completion for it delayed the finished turn even
+        # though the reply was already saved.
         yield finished
+        # Any finished run may deserve a name, including one that stopped on a budget
+        # or at the output limit. The title service owns its own guards (attempts,
+        # cooldown, provisional titles), so it decides whether to call the model.
+        _schedule_title(request, conversation_id, model_id)
 
 
 async def _drain(request, conversation_id, model_id):
@@ -243,6 +263,71 @@ async def continue_stream(conversation_id: str, request: Request, model_id: str 
 
 
 # --- files & workspace -------------------------------------------------------
+
+
+@router.get("/{conversation_id}/task")
+def get_task(conversation_id: str, request: Request) -> dict:
+    """The durable objective and plan, so the UI can show what the agent is doing."""
+    if _service(request).get(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    runtime = request.app.state.runtime
+    task = runtime.tasks.active(conversation_id)
+    if task is None:
+        return {"task": None}
+    return {
+        "task": {
+            "id": task.id,
+            "original_request": task.original_request,
+            "objective": task.objective,
+            "objective_revision": task.objective_revision,
+            "plan": runtime.tasks.plan_of(task),
+            "plan_revision": task.plan_revision,
+            "completion_criteria": task.completion_criteria,
+            "status": task.status,
+        }
+    }
+
+
+@router.get("/{conversation_id}/runs")
+def list_runs(conversation_id: str, request: Request) -> dict:
+    """Execution attempts, most recent first, with their recorded outcomes."""
+    if _service(request).get(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    from backend.repositories import RunRepository
+
+    with request.app.state.db.session() as session:
+        runs = RunRepository(session).list_for_conversation(conversation_id)
+        return {
+            "runs": [
+                {
+                    "id": run.id,
+                    "status": run.status,
+                    "stop_reason": run.stop_reason,
+                    "error": run.error,
+                    "iterations": run.iterations,
+                    "tool_calls": run.tool_calls,
+                    "started_at": run.started_at,
+                    "ended_at": run.ended_at,
+                }
+                for run in runs
+            ]
+        }
+
+
+@router.post("/{conversation_id}/attempts/{attempt_id}/reconcile", status_code=204)
+def reconcile_attempt(conversation_id: str, attempt_id: str, request: Request) -> None:
+    """Resolve an uncertain tool outcome after the operator has checked it.
+
+    Deliberately human-driven. The runtime cannot know whether a side effect landed,
+    and letting the model adjudicate its own uncertain effect would defeat the point.
+    """
+    if _service(request).get(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    ledger = request.app.state.runtime.ledger
+    known = {item["id"] for item in ledger.describe_conversation(conversation_id)["uncertain"]}
+    if attempt_id not in known:
+        raise HTTPException(status_code=404, detail="attempt not found or already settled")
+    ledger.mark_reconciled(attempt_id)
 
 
 @router.post("/{conversation_id}/files", status_code=201)

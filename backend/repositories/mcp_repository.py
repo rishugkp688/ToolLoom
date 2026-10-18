@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.models import MCPServer, Tool
+from backend.models.tool import EFFECTS
 from backend.utils import utcnow
 
 _UPDATABLE = {
@@ -113,9 +114,11 @@ class ToolRepository:
         tool = self.get_by_namespaced(namespaced_name)
         if tool is None:
             return None
-        for key in ("enabled", "approved", "risk"):
+        for key in ("enabled", "approved", "risk", "effect"):
             if key in fields and fields[key] is not None:
                 if key == "risk" and fields[key] not in {"low", "medium", "high"}:
+                    continue
+                if key == "effect" and fields[key] not in EFFECTS:
                     continue
                 setattr(tool, key, fields[key])
         tool.updated_at = utcnow()
@@ -148,6 +151,10 @@ class ToolRepository:
                         input_schema_json=schema_json,
                         enabled=default_enabled,
                         risk=item.get("risk") or "low",
+                        # Recorded on first sight so a later replacement has
+                        # something to be compared against.
+                        package_digest=item.get("digest"),
+                        effect=item.get("effect") or "unknown",
                     )
                 )
                 added += 1
@@ -158,6 +165,19 @@ class ToolRepository:
                 if item.get("risk") == "high" and row.risk != "high":
                     row.enabled = False
                     row.approved = False
+                digest = item.get("digest")
+                if digest and row.package_digest and row.package_digest != digest:
+                    # The installed package was replaced. The approval was given for
+                    # code that is no longer there, so it does not carry over: an
+                    # unchanged interface must not re-authorise a new implementation.
+                    row.enabled = False
+                    row.approved = False
+                if digest:
+                    row.package_digest = digest
+                # Code-provided classification fills in an unclassified tool. An
+                # operator's explicit choice is never overwritten by a re-discovery.
+                if item.get("effect") and row.effect in (None, "", "unknown"):
+                    row.effect = item["effect"]
                 changed = (
                     row.namespaced_name != namespaced
                     or row.description != (item.get("description") or "")

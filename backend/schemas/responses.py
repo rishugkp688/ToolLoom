@@ -57,6 +57,8 @@ class ToolOut(BaseModel):
     enabled: bool
     risk: str = "low"
     approved: bool = False
+    # Operator-owned effect classification: read_only | idempotent | mutating | unknown
+    effect: str = "unknown"
 
 
 class MCPServerOut(BaseModel):

@@ -39,7 +39,7 @@ from backend.services.providers.base import (
     ToolSpec,
     Usage,
     UsageEvent,
-    parse_arguments,
+    parse_arguments_safe,
 )
 
 _ANTHROPIC_VERSION = "2023-06-01"
@@ -339,11 +339,13 @@ class CommandCodeProvider(BaseProvider):
             acc = tool_acc[index]
             if not acc["id"] or not acc["name"]:
                 raise ProviderError("provider emitted an incomplete tool call (missing id/name)")
+            arguments, parse_error = parse_arguments_safe(acc["arguments"])
             blocks.append(
                 ToolCallBlock(
                     id=acc["id"],
                     name=acc["name"],
-                    arguments=parse_arguments(acc["arguments"]),
+                    arguments=arguments,
+                    parse_error=parse_error,
                 )
             )
         if finish_reason is None:
@@ -453,11 +455,13 @@ class CommandCodeProvider(BaseProvider):
                     raise ProviderError(
                         "provider emitted an incomplete tool call (missing id/name)"
                     )
+                arguments, parse_error = parse_arguments_safe(args_acc.get(index, ""))
                 model_blocks.append(
                     ToolCallBlock(
                         id=entry["id"],
                         name=entry["name"],
-                        arguments=parse_arguments(args_acc.get(index, "")),
+                        arguments=arguments,
+                        parse_error=parse_error,
                     )
                 )
             else:
@@ -560,14 +564,17 @@ def _to_openai_messages(messages: list[ProviderMessage], system: str | None) -> 
                 entry["tool_calls"] = tool_calls
             out.append(entry)
             continue
-        texts = "".join(b.text for b in message.blocks if isinstance(b, TextBlock))
-        if texts:
-            out.append({"role": "user", "content": texts})
+        # Tool results must answer the assistant's tool_calls before any ordinary user
+        # text: a message can carry both (the runtime appends loop advice to the same
+        # turn), and emitting the text first produces an invalid wire order.
         for block in message.blocks:
             if isinstance(block, ToolResultBlock):
                 out.append(
                     {"role": "tool", "tool_call_id": block.tool_call_id, "content": block.content}
                 )
+        texts = "".join(b.text for b in message.blocks if isinstance(b, TextBlock))
+        if texts:
+            out.append({"role": "user", "content": texts})
     return out
 
 

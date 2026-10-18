@@ -18,8 +18,10 @@ from backend.services.providers.base import (
     TextBlock,
     ToolResultBlock,
     ToolSpec,
+    block_to_dict,
     blocks_from_dicts,
 )
+from backend.services.sandbox.shell_tool import shell_available
 from backend.services.sandbox.workspace import workspace_for
 from backend.services.skills import read_skill_body
 
@@ -42,11 +44,19 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+class ContextBudgetError(ValueError):
+    """The prompt cannot be made to fit without losing something irreplaceable."""
+
+
 @dataclass
 class BuiltContext:
     system: str | None
     messages: list[ProviderMessage]
     tools: list[ToolSpec] = field(default_factory=list)
+    # How much of the history had to be reduced to make room. Surfaced so the UI and
+    # the transcript can say what happened rather than implying nothing was dropped.
+    pruned_results: int = 0
+    dropped_units: int = 0
 
 
 def repair_orphan_tool_uses(messages: list[ProviderMessage]) -> list[ProviderMessage]:
@@ -105,22 +115,165 @@ def estimate_tokens(
     return chars // 4 + 16 * len(messages)
 
 
-def _logical_turns(messages: list[ProviderMessage]) -> list[list[ProviderMessage]]:
-    """Group messages into turns that must be dropped whole.
+# --- fitting the window ------------------------------------------------------
 
-    A new turn starts at a user message that carries *text* (not just tool
-    results), so dropping whole turns preserves tool_use/tool_result pairing.
+# A tool result smaller than this is left alone: pruning it saves little and costs
+# the model context it may still need.
+PRUNE_MIN_CHARS = 1_200
+PRUNE_HEAD = 400
+PRUNE_TAIL = 200
+# The newest exchanges are never pruned: they are what the model is working on.
+PRUNE_PROTECT_RECENT_UNITS = 2
+
+# Prepended when trimming leaves the transcript opening with an assistant message.
+# Saying so is better than letting the model silently believe it saw everything.
+CONTINUATION_NOTICE = (
+    "[Earlier messages were dropped to fit this model's context window. "
+    "The task objective and plan in the system prompt remain authoritative.]"
+)
+
+
+@dataclass
+class UsageAnchor:
+    """The provider's own token count for a prompt we already sent.
+
+    Trusting it for the prefix and estimating only what was appended since removes
+    the situation where an irreversible decision — prune, summarise, refuse — rests
+    on a ``chars // 4`` guess. It is discarded the moment the system prompt or the
+    tool catalogue changes, because then it no longer describes the same prefix.
     """
-    turns: list[list[ProviderMessage]] = []
-    for message in messages:
-        starts_turn = message.role == "user" and not all(
-            isinstance(block, ToolResultBlock) for block in message.blocks
+
+    message_count: int
+    input_tokens: int
+    system_digest: str
+    tools_digest: str
+    # A digest of the messages that were actually sent. Pruning and dropping change
+    # the prompt in memory only, so the next iteration rebuilds the *unreduced*
+    # history from SQLite. Without this, the anchor's token count would be applied to
+    # a much larger prefix and the builder would skip reduction it actually needs.
+    prefix_digest: str
+
+
+def _digest(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _messages_digest(messages: list[ProviderMessage]) -> str:
+    return _digest(
+        json.dumps(
+            [{"role": m.role, "blocks": [block_to_dict(b) for b in m.blocks]} for m in messages],
+            sort_keys=True,
+            default=str,
         )
-        if starts_turn or not turns:
-            turns.append([message])
+    )
+
+
+def tools_digest(tools: list[ToolSpec]) -> str:
+    return _digest(
+        json.dumps(
+            [{"n": tool.name, "s": tool.input_schema} for tool in tools],
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+def anchor_for(
+    messages: list[ProviderMessage], system: str | None, tools: list[ToolSpec], input_tokens: int
+) -> UsageAnchor:
+    return UsageAnchor(
+        message_count=len(messages),
+        input_tokens=input_tokens,
+        system_digest=_digest(system or ""),
+        tools_digest=tools_digest(tools),
+        prefix_digest=_messages_digest(messages),
+    )
+
+
+def estimate_with_anchor(
+    anchor: UsageAnchor | None,
+    messages: list[ProviderMessage],
+    system: str | None,
+    tools: list[ToolSpec],
+) -> int:
+    """Provider-anchored when the anchor still describes this prefix, else heuristic."""
+    if anchor is None:
+        return estimate_tokens(messages, system, tools)
+    if anchor.system_digest != _digest(system or ""):
+        return estimate_tokens(messages, system, tools)
+    if anchor.tools_digest != tools_digest(tools):
+        return estimate_tokens(messages, system, tools)
+    if not 0 <= anchor.message_count <= len(messages):
+        return estimate_tokens(messages, system, tools)
+    if _messages_digest(messages[: anchor.message_count]) != anchor.prefix_digest:
+        # The prefix is not what the provider measured (it was pruned, dropped or
+        # rebuilt differently), so the anchor no longer applies.
+        return estimate_tokens(messages, system, tools)
+    appended = messages[anchor.message_count :]
+    return anchor.input_tokens + estimate_tokens(appended, None, [])
+
+
+def _has_tool_use(message: ProviderMessage) -> bool:
+    return any(getattr(block, "type", None) == "tool_use" for block in message.blocks)
+
+
+def _results_only(message: ProviderMessage) -> bool:
+    return (
+        message.role == "user"
+        and bool(message.blocks)
+        and all(isinstance(block, ToolResultBlock) for block in message.blocks)
+    )
+
+
+def units_of(messages: list[ProviderMessage]) -> list[list[ProviderMessage]]:
+    """Group messages into droppable units that keep tool pairing intact.
+
+    A unit is one *exchange*: an assistant message together with the tool results
+    answering it, or a standalone message. The earlier grouping started a new unit
+    only at a user message carrying text, which made an entire run of a hundred tool
+    calls a single indivisible unit — so nothing could ever be dropped and the run
+    died at the budget instead of shedding old work.
+    """
+    units: list[list[ProviderMessage]] = []
+    for message in messages:
+        if _results_only(message) and units and _has_tool_use(units[-1][-1]):
+            units[-1].append(message)
         else:
-            turns[-1].append(message)
-    return turns
+            units.append([message])
+    return units
+
+
+def flatten(units: list[list[ProviderMessage]]) -> list[ProviderMessage]:
+    return [message for unit in units for message in unit]
+
+
+def prune_tool_results(
+    units: list[list[ProviderMessage]], *, protect_recent: int = PRUNE_PROTECT_RECENT_UNITS
+) -> int:
+    """Shrink old tool results in place: head, tail and a size note.
+
+    Deterministic and free — no model call. Tool *results* are the bulk of a long
+    run and the least informative per token, while the assistant's ``tool_use``
+    blocks, which say what was called and with what arguments, are left untouched.
+    The action history therefore survives while its volume collapses.
+    """
+    cutoff = max(0, len(units) - protect_recent)
+    pruned = 0
+    for unit in units[:cutoff]:
+        for message in unit:
+            for block in message.blocks:
+                if not isinstance(block, ToolResultBlock):
+                    continue
+                if len(block.content) <= PRUNE_MIN_CHARS:
+                    continue
+                head = block.content[:PRUNE_HEAD]
+                tail = block.content[-PRUNE_TAIL:]
+                removed = len(block.content) - len(head) - len(tail)
+                block.content = f"{head}\n…[{removed} characters pruned]…\n{tail}"
+                pruned += 1
+    return pruned
 
 
 class ContextBuilder:
@@ -129,7 +282,24 @@ class ContextBuilder:
         self.settings = settings
         self.budget = budget or budget_for(settings)
 
-    def build(self, conversation_id: str, *, advisory: str | None = None) -> BuiltContext:
+    def build(
+        self,
+        conversation_id: str,
+        *,
+        advisory: str | None = None,
+        pinned: str = "",
+        anchor: UsageAnchor | None = None,
+        allow_drop: bool = True,
+    ) -> BuiltContext:
+        """Assemble the prompt, reducing history as needed to fit the window.
+
+        ``pinned`` is rendered into the system prompt, which puts the task objective
+        and plan outside the message-trimming path: they cannot be summarised away,
+        however long the run gets. With ``allow_drop=False`` this raises
+        ``ContextBudgetError`` rather than shedding exchanges, so a caller can
+        summarise first.
+        """
+        summary_text: str | None = None
         with self.db.session() as session:
             conv = ConversationRepository(session).get(conversation_id)
             message_repo = MessageRepository(session)
@@ -159,6 +329,10 @@ class ContextBuilder:
                     and not self.settings.toolloom_allow_python
                 ):
                     continue
+                if tool.namespaced_name == "sandbox__shell" and not (
+                    self.settings.toolloom_allow_shell and shell_available()
+                ):
+                    continue
                 try:
                     schema = json.loads(tool.input_schema_json or "{}")
                 except json.JSONDecodeError:
@@ -173,13 +347,11 @@ class ContextBuilder:
 
             messages: list[ProviderMessage] = []
             if conv is not None and conv.summary and conv.summary_message_count:
-                messages.append(
-                    ProviderMessage(
-                        role="user", blocks=[TextBlock(text="Summary of earlier conversation:")]
-                    )
-                )
-                messages.append(
-                    ProviderMessage(role="assistant", blocks=[TextBlock(text=conv.summary)])
+                # One user message, not a user/assistant pair: the kept suffix may
+                # begin with an assistant tool call, and two assistant messages in a
+                # row is not a valid transcript.
+                summary_text = (
+                    f"Summary of earlier conversation:\n{conv.summary}"
                 )
                 rows = rows[conv.summary_message_count :]
 
@@ -214,37 +386,123 @@ class ContextBuilder:
                 else:
                     messages.append(ProviderMessage(role="user", blocks=blocks))
 
-        system = self._system_prompt(skills, user_prompt, conversation_id)
+        if summary_text:
+            # Merge into a leading user message rather than creating two adjacent
+            # user turns; otherwise the summary is its own opening turn.
+            if messages and messages[0].role == "user" and not _results_only(messages[0]):
+                messages[0].blocks = [TextBlock(text=summary_text + "\n\n"), *messages[0].blocks]
+            else:
+                messages.insert(
+                    0, ProviderMessage(role="user", blocks=[TextBlock(text=summary_text)])
+                )
+
+        system = self._system_prompt(skills, user_prompt, conversation_id, pinned=pinned)
         messages = repair_orphan_tool_uses(messages)
         if advisory:
             messages = self._merge_advisory(messages, advisory)
-        messages = self._fit_within_budget(messages, system, tool_specs)
-        if estimate_tokens(messages, system, tool_specs) > self._token_budget():
-            raise ValueError(
-                "The latest turn and enabled tools exceed this model's context budget. "
-                "Choose a larger-context model, shorten the message, or disable unused tools."
-            )
-        return BuiltContext(system=system, messages=messages, tools=tool_specs)
+        messages, pruned, dropped = self._fit(
+            messages, system, tool_specs, anchor, allow_drop=allow_drop
+        )
+        return BuiltContext(
+            system=system,
+            messages=messages,
+            tools=tool_specs,
+            pruned_results=pruned,
+            dropped_units=dropped,
+        )
 
     # -- helpers --------------------------------------------------------------
 
     def _token_budget(self) -> int:
         return self.budget.input_tokens
 
-    def _fit_within_budget(
-        self, messages: list[ProviderMessage], system: str | None, tools: list[ToolSpec]
-    ) -> list[ProviderMessage]:
+    def _fit(
+        self,
+        messages: list[ProviderMessage],
+        system: str | None,
+        tools: list[ToolSpec],
+        anchor: UsageAnchor | None = None,
+        *,
+        allow_drop: bool = True,
+    ) -> tuple[list[ProviderMessage], int, int]:
+        """Reduce the prompt until it fits. Returns (messages, pruned, dropped).
+
+        The order is deliberate. Pruning old tool results is free. Summarising keeps
+        the facts. Dropping exchanges is the only step that truly loses information,
+        so with ``allow_drop=False`` this raises instead, and the caller gets the
+        chance to summarise first.
+
+        It raises only when nothing lossless remains: if the system prompt, the tool
+        schemas and the newest exchange together exceed the window, there is no
+        correct way to proceed and an explicit error beats silently truncating the
+        operator's own message.
+        """
         budget = self._token_budget()
-        turns = _logical_turns(messages)
-        while (
-            len(turns) > 1
-            and estimate_tokens([m for turn in turns for m in turn], system, tools) > budget
-        ):
-            turns.pop(0)
-        # Never leave a leading assistant turn (its tool pairing may be gone).
-        while turns and turns[0][0].role != "user":
-            turns.pop(0)
-        return [message for turn in turns for message in turn]
+        if estimate_with_anchor(anchor, messages, system, tools) <= budget:
+            return messages, 0, 0
+
+        # Past this point the prompt is being modified, so the anchor no longer
+        # describes the prefix it was taken from and the heuristic takes over.
+        units = units_of(messages)
+        pruned = prune_tool_results(units)
+        if estimate_tokens(flatten(units), system, tools) <= budget:
+            return flatten(units), pruned, 0
+        if not allow_drop:
+            raise ContextBudgetError(self._budget_message(budget))
+
+        # Shed the oldest exchanges first, never the newest: that is what the model is
+        # being asked to act on. The original request stays safe to drop because the
+        # pinned task block in the system prompt carries it independently.
+        start = 0
+        while start < len(units) - 1:
+            if estimate_tokens(flatten(units[start:]), system, tools) <= budget:
+                break
+            start += 1
+        kept = units[start:]
+        fitted = self._normalise_opening(kept)
+
+        if estimate_tokens(fitted, system, tools) > budget:
+            # Dropping cannot help: the newest exchange alone is over budget, which
+            # happens when a model reads several large files in one turn. Its tool
+            # results are the only thing left that can shrink, so prune them too —
+            # head, size and tail — rather than failing a run that is otherwise fine.
+            # The full results stay durable in SQLite; this only reduces the prompt.
+            pruned += prune_tool_results(kept, protect_recent=0)
+            fitted = self._normalise_opening(kept)
+
+        if estimate_tokens(fitted, system, tools) > budget:
+            raise ContextBudgetError(self._budget_message(budget))
+        return fitted, pruned, len(units) - len(kept)
+
+    @staticmethod
+    def _normalise_opening(kept: list[list[ProviderMessage]]) -> list[ProviderMessage]:
+        """Make the kept slice openable.
+
+        A transcript may not start with an assistant message, and must never start
+        with a tool result whose call was dropped — a provider rejects a result it
+        never saw requested. Rather than popping until a user turn happens to appear,
+        which would discard the recent work the model needs, say plainly that history
+        was reduced and let the pinned task block carry the objective.
+        """
+        while len(kept) > 1 and _results_only(kept[0][0]):
+            kept.pop(0)
+        fitted = flatten(kept)
+        if fitted and _results_only(fitted[0]):
+            # Their calls are gone, so the results cannot be sent at all: replace the
+            # opening with the notice rather than an orphaned result a provider rejects.
+            fitted = [ProviderMessage("user", [TextBlock(CONTINUATION_NOTICE)]), *fitted[1:]]
+        elif fitted and fitted[0].role != "user":
+            fitted = [ProviderMessage("user", [TextBlock(CONTINUATION_NOTICE)]), *fitted]
+        return fitted
+
+    @staticmethod
+    def _budget_message(budget: int) -> str:
+        return (
+            "The newest message, together with the system prompt, the pinned task "
+            f"state and the enabled tools, needs more than this model's {budget}-token "
+            "input budget. Shorten the message, disable unused tools, or choose a "
+            "model with a larger context window."
+        )
 
     @staticmethod
     def _merge_advisory(messages: list[ProviderMessage], advisory: str) -> list[ProviderMessage]:
@@ -256,11 +514,15 @@ class ContextBuilder:
             messages = list(messages) + [ProviderMessage(role="user", blocks=[block])]
         return messages
 
-    def _system_prompt(self, skills, user_prompt: str, conversation_id: str) -> str:
+    def _system_prompt(
+        self, skills, user_prompt: str, conversation_id: str, *, pinned: str = ""
+    ) -> str:
         parts = [DEFAULT_SYSTEM_PROMPT]
         skills_section = self._skills_section(skills)
         if skills_section:
             parts.append(skills_section)
+        if pinned.strip():
+            parts.append(pinned.strip())
         status = self._workspace_status(conversation_id)
         if status:
             parts.append(status)

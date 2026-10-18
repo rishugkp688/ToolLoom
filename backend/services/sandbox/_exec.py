@@ -16,13 +16,39 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
 from contextlib import suppress
 from dataclasses import dataclass
 
 # Kept deliberately small. HOME is excluded so a tool cannot quietly write into
-# the operator's home directory by expanding a path.
+# the operator's home directory by expanding a path. Callers that genuinely need
+# a home directory (the shell tool, for toolchain caches) add it explicitly.
 _ENV_ALLOWLIST = ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
+
+
+def find_posix_shell() -> list[str] | None:
+    """The interpreter flags for a POSIX shell, or None when there is no shell.
+
+    bash is preferred over sh for its predictable builtins. Windows without Git
+    Bash or WSL has neither, and callers must say so rather than falling back to
+    cmd, whose semantics differ enough to make the same command mean something
+    else.
+
+    ``pipefail`` is set deliberately. A pipeline reports the status of its *last*
+    command, so the very common ``pytest | tail -20`` would report success while
+    the tests were failing — the tool would hand the model an ``exit_code`` of 0
+    next to a screen of failures, and a weak model reads the exit code. With
+    pipefail the real failure surfaces, so ``is_error`` is trustworthy for piped
+    commands. ``sh`` has no pipefail, so that guarantee is bash-only.
+    """
+    bash = shutil.which("bash")
+    if bash:
+        return [bash, "-o", "pipefail", "-c"]
+    sh = shutil.which("sh")
+    if sh:
+        return [sh, "-c"]
+    return None
 
 
 @dataclass
@@ -30,8 +56,12 @@ class ExecResult:
     stdout: str
     stderr: str
     exit_code: int | None
-    # "exited" | "timeout" | "output_limit"
+    # "exited" | "timeout"
     stop_reason: str
+    # True when the retained output hit the cap. The command still ran to
+    # completion: killing a build because its log is noisy is a worse outcome than
+    # keeping a bounded view of it.
+    truncated: bool = False
 
     @property
     def ok(self) -> bool:
@@ -91,16 +121,20 @@ async def run_argv(
     )
     stdout, stderr = bytearray(), bytearray()
     total = 0
+    truncated = False
     reason: str | None = None
 
     async def read(stream, sink: bytearray) -> None:
-        nonlocal total
+        nonlocal total, truncated
         while chunk := await stream.read(4096):
             remaining = max(0, max_bytes - total)
-            sink.extend(chunk[:remaining])
+            if remaining:
+                sink.extend(chunk[:remaining])
             total += len(chunk)
             if total > max_bytes:
-                raise OverflowError("output limit exceeded")
+                # Keep draining so the child never blocks on a full pipe, but stop
+                # retaining. The wall-clock timeout, not the log size, is the bound.
+                truncated = True
 
     tasks = [
         asyncio.create_task(read(process.stdout, stdout)),
@@ -111,8 +145,6 @@ async def run_argv(
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
     except TimeoutError:
         reason = "timeout"
-    except OverflowError:
-        reason = "output_limit"
     finally:
         # Cancellation must terminate execution too, not leave a background writer.
         import anyio
@@ -127,4 +159,5 @@ async def run_argv(
         stderr=stderr.decode("utf-8", "replace"),
         exit_code=process.returncode,
         stop_reason=reason or "exited",
+        truncated=truncated,
     )

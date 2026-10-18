@@ -42,6 +42,7 @@ async def execute(arguments, context, settings) -> ToolCallOutcome:
                 "stderr": result.stderr,
                 "exit_code": result.exit_code,
                 "stop_reason": result.stop_reason,
+                "truncated": result.truncated,
             }
         ),
         is_error=not result.ok,

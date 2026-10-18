@@ -294,12 +294,17 @@ class ToolRegistry:
             if server is None:
                 return None
             namespaced = f"{server.name}__{tool_name}"
-            if namespaced in {"sandbox__python", "sandbox__http_fetch"}:
+            if namespaced in {"sandbox__python", "sandbox__shell", "sandbox__http_fetch"}:
                 if fields.get("risk", "high") != "high":
                     raise RegistryError("this built-in tool must remain high-risk")
             if namespaced == "sandbox__python" and fields.get("enabled"):
                 if not self.settings.toolloom_allow_python:
                     raise RegistryError("Python requires TOOLLOOM_ALLOW_PYTHON=1 and a restart")
+            if namespaced == "sandbox__shell" and fields.get("enabled"):
+                if not self.settings.toolloom_allow_shell:
+                    raise RegistryError(
+                        "Shell execution requires TOOLLOOM_ALLOW_SHELL=1 and a restart"
+                    )
             return ToolRepository(session).update(namespaced, **fields)
 
     async def discover(self, server_id: str) -> DiscoveryResult:

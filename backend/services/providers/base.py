@@ -58,6 +58,9 @@ class ToolCallBlock:
     name: str
     arguments: dict[str, Any]
     type: Literal["tool_use"] = "tool_use"
+    # Set when the provider's argument string was not valid JSON. The call is still
+    # surfaced so the model can be told to re-issue it, instead of the run dying.
+    parse_error: str | None = None
 
 
 @dataclass
@@ -238,3 +241,21 @@ def parse_arguments(raw: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ProviderError("tool-call arguments must be a JSON object")
     return parsed
+
+
+def parse_arguments_safe(raw: str) -> tuple[dict[str, Any], str | None]:
+    """Parse tool-call arguments without aborting the run.
+
+    A model emitting invalid JSON is a *correctable* mistake, not a transport
+    failure. Killing the run loses everything already done, so the call is surfaced
+    with ``parse_error`` set and the runtime returns a corrective tool error — the
+    model gets a chance to re-issue it.
+    """
+    text = (raw or "").strip() or "{}"
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return {}, f"arguments were not valid JSON ({exc.msg} at character {exc.pos})"
+    if not isinstance(parsed, dict):
+        return {}, "arguments must be a JSON object"
+    return parsed, None

@@ -34,6 +34,7 @@ from backend.api import (
 )
 from backend.config import Settings
 from backend.db import Database
+from backend.repositories import RunRepository, ToolAttemptRepository
 from backend.runtime import AgentRuntime
 from backend.services.context_compactor import ContextCompactor
 from backend.services.conversation_titles import ConversationTitles
@@ -50,6 +51,12 @@ from backend.services.usage_service import UsageService
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 _STATE_CHANGING = {"POST", "PUT", "PATCH", "DELETE"}
+
+# Generous next to the 2 MB per-file upload limit, but it stops a multi-gigabyte body
+# from being buffered into memory before any field-level validation runs. This checks
+# the declared Content-Length; a chunked body without one is bounded only by the
+# per-field limits, which is stated rather than implied.
+MAX_BODY_BYTES = 32 * 1024 * 1024
 _LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -124,6 +131,13 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
     secret_service = SecretService(db, vault)
     compactor = ContextCompactor(db, settings, app.state.provider)
 
+    # Crash recovery: a run left "running" and an attempt left pending/running mean the
+    # process died mid-flight. Saying so on boot is what turns an unknowable gap into a
+    # record a resume can reason about — the alternative is claiming work is still live.
+    with db.session() as session:
+        RunRepository(session).reconcile_orphans()
+        ToolAttemptRepository(session).reconcile_orphans()
+
     app.state.vault = vault
     app.state.secret_resolver = secret_resolver
     app.state.secret_service = secret_service
@@ -156,6 +170,9 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
             origin = request.headers.get("origin")
             if origin and not _allowed_origin(origin, str(request.base_url).rstrip("/")):
                 return JSONResponse(status_code=403, content={"detail": "origin not allowed"})
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+            return JSONResponse(status_code=413, content={"detail": "request body too large"})
         try:
             return await call_next(request)
         except Exception as exc:

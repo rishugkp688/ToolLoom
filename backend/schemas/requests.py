@@ -4,10 +4,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CreateConversationRequest(BaseModel):
+    # Unknown fields are rejected rather than ignored: a client that sends
+    # {"message": ...} here should get an error, not an empty conversation.
+    model_config = ConfigDict(extra="forbid")
     title: str | None = Field(default=None, max_length=255)
 
 
 class SendMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     message: str = Field(min_length=0, max_length=200_000, default="")
     model_id: str | None = None
     attachments: list[str] = Field(default_factory=list, max_length=10)
@@ -39,6 +43,9 @@ class CreateMCPServerRequest(BaseModel):
 
 
 class UpdateMCPServerRequest(BaseModel):
+    # Strict: a typo such as {"verify_ssl"} must fail rather than silently leave a
+    # security setting unchanged while reporting success.
+    model_config = ConfigDict(extra="forbid")
     enabled: bool | None = None
     url: str | None = None
     headers: dict[str, str] | None = None
@@ -47,6 +54,12 @@ class UpdateMCPServerRequest(BaseModel):
 
 
 class UpdateToolRequest(BaseModel):
+    # Strict: {"enable": true} (a typo for enabled) must not return 200 and quietly
+    # leave a tool disabled or unapproved.
+    model_config = ConfigDict(extra="forbid")
     enabled: bool | None = None
     approved: bool | None = None
     risk: str | None = Field(default=None, pattern="^(low|medium|high)$")
+    # Operator-owned effect classification. `unknown` is the safe default: no blind
+    # retry after an uncertain outcome, and no concurrency.
+    effect: str | None = Field(default=None, pattern="^(read_only|idempotent|mutating|unknown)$")

@@ -66,6 +66,7 @@ def _tool_out(tool) -> ToolOut:
         enabled=tool.enabled,
         risk=getattr(tool, "risk", "low"),
         approved=getattr(tool, "approved", False),
+        effect=getattr(tool, "effect", "unknown") or "unknown",
     )
 
 
@@ -202,6 +203,8 @@ def update_tool(
         fields["approved"] = body.approved
     if body.risk is not None:
         fields["risk"] = body.risk
+    if body.effect is not None:
+        fields["effect"] = body.effect
     try:
         tool = _registry(request).update_tool(server_id, tool_name, **fields)
     except RegistryError as exc:

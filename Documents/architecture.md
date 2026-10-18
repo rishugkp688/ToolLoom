@@ -1,8 +1,17 @@
 # ToolLoom architecture
 
+The [2026-10-18 code and architecture review](code-architecture-review-2026-10-18.md)
+records current verification and reproduced gaps in outcome tracking, approval,
+context anchors and task state. Read it alongside the mechanism descriptions here;
+the documented intent is stronger than the implementation in those failure paths.
+
 This document explains what ToolLoom is, how a request travels through it, and
 why the main pieces are built the way they are. It describes the code in this
 repository as it stands. It is not a roadmap.
+
+Where a mechanism has a known limit, the limit is stated next to the mechanism
+rather than collected elsewhere, so no section here should be read as a guarantee
+the code does not make.
 
 ## 1. What ToolLoom is
 
@@ -19,9 +28,9 @@ That decision buys four things:
   swapping a model means writing an adapter, not touching the runtime.
 - **Tools are uniform.** An in-process helper and a remote MCP server are
   discovered, validated and dispatched the same way.
-- **Nothing leaves the box by default.** The server binds loopback, holds the
-  credentials, and ships with every capability that reaches the network or the
-  OS switched off.
+- **Storage and control stay local.** The server binds loopback and holds the
+  credentials. Configured inference sends context to Command Code; network and
+  executable tools require separate operator enablement.
 
 The frontend is deliberately thin. It renders state and forwards input. It never
 calls a model, never holds a key, and never decides what happens next.
@@ -165,9 +174,12 @@ is never reported as a clean finish: `length` becomes `max_tokens`, and a stream
 that ends without a finish reason becomes `error`.
 
 Ceilings: `TOOLLOOM_MAX_ITERATIONS` (12), `TOOLLOOM_MAX_TOOL_CALLS` (40),
-`TOOLLOOM_RUN_TIMEOUT_SECONDS` (300) and `TOOLLOOM_MAX_PAYLOAD_BYTES`. The
-**Unlimited steps** switch removes the two count caps for later runs, and leaves
-the guards, timeouts, context limits and approvals in place.
+`TOOLLOOM_RUN_TIMEOUT_SECONDS` (300) and `TOOLLOOM_MAX_OUTPUT_CONTINUATIONS` (3).
+Without that last one, a reply the provider cut off at the output limit ends the run
+and the operator has to click Continue; with it, the run finishes the answer, and any
+tool call from a truncated turn is refused rather than executed with partial
+arguments. The **Unlimited steps** switch removes the two count caps for later runs,
+and leaves the guards, timeouts, context limits and approvals in place.
 
 `StepController` is deterministic and does no I/O. It flags three identical calls
 with the same arguments, refuses a tool after three consecutive failures in one
@@ -193,10 +205,11 @@ complete. The Anthropic-compatible path normalizes `tool_use`, `tool_result`,
 text blocks, stop reasons and usage into the same contract. Style is chosen by
 `COMMANDCODE_API_STYLE`, with `auto` routing Claude models to `/messages`.
 
-Retries happen only on failures that provably did not reach the server, so a
-retry cannot double-charge a request or replay an effect. If a response has
-already begun streaming, an interruption is surfaced instead of silently
-restarting.
+Provider retries are bounded and apply to connection failures and HTTP
+502/503/504 responses before streaming begins. An HTTP error does not prove that
+upstream inference did no work, so this is not a no-double-charge guarantee.
+Interrupted streaming is surfaced rather than silently restarted. Tool dispatch
+has its own narrower retry policy.
 
 `FakeProvider` implements the same contract deterministically. It supports
 scripted turns, which is how the tool-use, interruption and resume tests drive
@@ -272,6 +285,7 @@ and every one of its tools starts disabled.
 | `http_fetch` | high | Fetch a public URL, with SSRF controls |
 | `web_search` | high | Keyless search: DuckDuckGo, Wikipedia, or your own SearXNG |
 | `python` | high | Run Python in the workspace. Not OS-isolated |
+| `shell` | high | Run a shell command. Not OS-isolated. The verification primitive |
 | `skill_list`, `skill_read` | low | Read installed skills |
 | `foundry_scaffold` | low | Write a capability package skeleton |
 | `foundry_validate`, `foundry_install` | high | Run generated tests, then install |
@@ -298,6 +312,28 @@ of silently returning nothing.
 **`python` controls.** Off by default. Runs `sys.executable` with the workspace
 as the working directory and a minimal environment. 15-second default timeout and
 a 64,000-byte combined output cap, both configurable.
+
+**`shell` controls.** Off by default, and the reason the agent can check its own
+work: run the test suite, read the failure, fix it. Without a primitive like this
+an agent can write a project but never establish that it runs, which makes "done"
+unfalsifiable.
+
+It is a real shell (`bash`, else `sh`), so pipes, `&&` and substitution behave as
+the operator expects. `find_posix_shell` returns `None` when neither exists, and
+the tool is then neither advertised nor runnable rather than silently falling back
+to `cmd`, whose semantics would change what a command means. Arguments are
+validated before dispatch, the command length is bounded, `cwd` defaults to the
+conversation workspace, and wall clock and combined output follow the same
+`_exec` policy as `python` — including killing the whole process tree on expiry.
+
+The child gets `minimal_env` rather than the operator's environment, so provider
+keys and vault material cannot leak into a command, with `HOME` added because real
+toolchains need it for caches and configuration. `cwd` may point outside the
+workspace: the command could `cd` there anyway, so confining the argument would
+be a false guarantee rather than a boundary. The tool is therefore documented the
+same way `python` is — bounded, not contained — and is gated four times over:
+`TOOLLOOM_ALLOW_SHELL`, the enable flag, the approval requirement, and removal
+from the prompt when the flag is off.
 
 ## 10. Tool Foundry
 
@@ -327,11 +363,20 @@ yet that suggestions would be welcome.
 
 ### 10.2 Why installed packages leave the workspace
 
-The workspace is agent-writable through `fs_write`. A package kept there could be
-rewritten after the operator had reviewed and approved it, which would make an
-integrity hash meaningless. Installation copies the package out to
-`<data_dir>/tools/`, where no agent tool can write. One version per name is active;
-installing again replaces it and records the new version.
+Installation copies the package to `<data_dir>/tools/`, outside the
+workspace-scoped filesystem API. This is not an OS boundary: opted-in Python and
+generated code run as the same user, can read that directory, and can rewrite it
+along with the records below. One version per name is active, and the new version
+is published before the superseded one is retired, so an interrupted install
+cannot lose the tool.
+
+Approval is bound to the package **digest**, not to the tool's interface. Every
+file is covered — entrypoint, helper modules, resources and the manifest — because
+any of them can change what a package does. Consequences worth stating plainly:
+reinstalling a package whose files changed revokes its approval and disables it,
+so an unchanged schema can never re-authorise new code; a change to any file makes
+it refuse to run; and a symlink inside a package fails the digest rather than being
+followed out of it.
 
 ### 10.3 The manifest is a proposal, not an enforcement layer
 
@@ -409,32 +454,83 @@ forward migration that inspects the schema and issues `ALTER TABLE ADD COLUMN`
 for columns introduced after a database was first created. That is how an
 existing `.local/toolloom.db` picks up new fields without data loss.
 
-## 12. Context management
 
-Four mechanisms keep a long conversation inside the model's window. The window
-comes from the provider catalogue, and `MODEL_CONTEXT_WINDOW` can impose a
-smaller local cap.
+## 12. Durable execution and recovery
 
-1. **Budget.** The builder reserves the response allowance plus estimation
-   headroom, and drops the oldest complete logical turns until the rest fits. A
-   turn is a user message that carries text plus everything up to the next one,
-   so a tool call and its result are never split.
-2. **Compaction.** When the pending transcript crosses the trigger,
-   `ContextCompactor` summarizes older turns through the same provider, snapping
-   the cutoff backwards to a user boundary so the newest turn is never folded in.
-   The summary is stored on the conversation and prepended on later turns.
-3. **Repair.** `repair_orphan_tool_uses` guarantees every `tool_use` block is
-   followed by a matching `tool_result`. A missing result is injected as an
-   explicit error reading `[no result available]`. Nothing is fabricated as a
-   success.
-4. **Truncation.** Oversized tool output is bounded as described in section 7.
+Four identities, deliberately distinct:
 
-There is no tokenizer dependency. Estimates are approximate and the UI says so.
+- **Conversation** — what was said. The `messages` table.
+- **Task** — what is being accomplished: `original_request` (immutable), `objective`
+  and `plan` (each versioned), and `completion_criteria`.
+- **Run** — one attempt: status, stop reason, iteration and tool-call counts.
+- **Tool attempt** — one dispatch: the tool, a digest of its arguments, the effect
+  classification in force, and an outcome.
 
-## 13. Concurrency
+The loop is still owned by the streaming request. These rows make each attempt
+*accountable*, not detached.
 
-Run reservations are process-local: a set on the app state, plus a lock around
-transitions.
+**Recorded before dispatch.** An attempt is written as `pending`, moved to `running`
+at dispatch, and settled when the result is persisted, independently of the SSE
+stream. A process that dies in between leaves a row rather than a gap.
+
+**Recovered on boot.** A run left `running` becomes `interrupted`; an attempt left
+`pending` or `running` becomes `unknown`. On resume the model receives the previous
+run's status, the mutations already completed, and the outcomes that are uncertain,
+so it continues from evidence instead of being told to carry on.
+
+**No blind retries.** Re-dispatching an identical call whose outcome is `unknown` is
+refused unless the tool is `read_only`, with a message naming the uncertainty and
+suggesting a check first. Resolving it is an operator action
+(`POST /conversations/{id}/attempts/{id}/reconcile`), because the runtime cannot know
+whether the side effect landed.
+
+**Effect classification is ours, not theirs.** `tools.effect` is
+`read_only | idempotent | mutating | unknown`, defaults to `unknown`, and is
+operator-controllable. It is never inferred from an MCP server's own description: a
+server calling a tool read-only is stating an intent, not a guarantee. Our own reads
+are pre-classified because we wrote them; `shell`, `python` and generated
+capabilities stay `unknown`, which keeps them sequential and non-retryable.
+
+**Plan state is pinned.** `plan_read` and `plan_write` maintain the task. The
+rendered objective and plan go into the *system* prompt, outside the message-trimming
+path, so no amount of summarisation can remove them. `plan.md` in the workspace is a
+projection of the record, never a second authority.
+
+## 13. Context management
+
+`ContextPolicy` owns the whole fitting sequence and runs on every iteration. The
+order is chosen by cost:
+
+1. **Fit.** If the prompt fits, nothing happens. The provider's own
+   `usage.input_tokens` for the previous prompt is trusted for that prefix and only
+   messages appended since are estimated; the anchor is discarded when the system
+   prompt or the tool catalogue changes.
+2. **Prune tool results.** Old results are sliced to a head, a size note and a tail.
+   Deterministic, no model call. The assistant's `tool_use` blocks are untouched, so
+   the action history stays legible while its volume collapses.
+3. **Summarise.** Only when pruning is not enough. `ContextCompactor` uses the same
+   provider and keeps a verbatim recent suffix. A summary is accepted only on a
+   completed turn, so a truncated one cannot make the messages it covered disappear.
+4. **Drop the oldest exchanges.** The only step that truly loses information. A unit
+   is one exchange — an assistant message together with the results answering it — so
+   a run of a hundred tool calls is a hundred droppable units rather than one
+   indivisible turn. The newest exchange is never dropped; when trimming leaves the
+   transcript opening with an assistant message, an explicit note says earlier
+   messages were dropped.
+5. **Refuse.** If the system prompt, the tool schemas and the newest exchange alone
+   exceed the window, no lossless path exists, so the run fails with a clear,
+   recoverable error naming the budget. Silently truncating the operator's own
+   message would be worse.
+
+Repair and truncation are unchanged: `repair_orphan_tool_uses` never fabricates a
+success, and oversized output is bounded as described in section 7. There is no
+tokenizer dependency; estimates are approximate and the UI says so.
+
+## 14. Concurrency
+
+Run reservations are process-local: a set on the app state. The current
+check/add/remove paths contain no await and execute on the event loop; there is
+no separate lock around these transitions.
 
 - One active run per conversation. A second request returns `409`.
 - At most 16 active runs globally. Beyond that the request returns `429`.
@@ -447,7 +543,7 @@ transitions.
 One Uvicorn worker is the supported topology. The reservation set is in memory,
 so multiple workers would not share it.
 
-## 14. Security boundaries
+## 15. Security boundaries
 
 Enforced in code:
 
@@ -462,9 +558,10 @@ Enforced in code:
   no backslashes, no symlink entries, and a 25 MB expansion cap.
 - Generated capability packages are validated before installation: the manifest
   must parse, the entrypoint and tests must resolve inside the package, and the
-  suite must run and pass. Installation copies the package to a directory no agent
-  tool can write to, and every run re-hashes the entrypoint against the value
-  recorded at approval.
+  suite must run and pass. Installation copies the package outside the workspace
+  filesystem API, and every run re-hashes the entrypoint against the value
+  recorded at installation. That value is not yet bound to operator approval;
+  imports and manifest changes are not covered by execution integrity.
 - Tool output, uploaded files and skill bodies are data. The system prompt says
   so, and inlined skill bodies have `</` neutralized so a skill cannot close its
   own tags.
@@ -474,6 +571,11 @@ Stated rather than papered over:
 - **`python` is not a sandbox.** It runs with your privileges. Time and output
   limits protect normal runs, not adversarial ones. Real isolation would need a
   container or a separate user account, which this project does not provide.
+- **`shell` is not a sandbox either**, and confining it would be a lie rather than
+  a boundary: any command can `cd` anywhere, so the tool says plainly that it runs
+  with your privileges and leaves `cwd` unconfined. What it does provide is the
+  ability to verify work instead of asserting it, which is why it exists. Time and
+  output limits protect ordinary runs, not adversarial ones.
 - **A capability has the same limits, and no more.** Validation executes generated
   tests and the installed tool executes generated code, both as your user. What
   the runtime adds is review before installation, a hash check against later edits,
@@ -487,7 +589,7 @@ Stated rather than papered over:
   follows instructions found in a web page is a model-level problem, bounded here
   by which tools are enabled and approved.
 
-## 15. Frontend
+## 16. Frontend
 
 Plain HTML, CSS and JavaScript served by FastAPI. No framework, no build step, no
 CDN at runtime: the Geist variable font is bundled with its licence.
@@ -513,7 +615,7 @@ CSS already honours on its own; when nothing is stored the switch reflects the
 operating system's setting. Transcript, usage, tool execution, workspace files and
 credentials stay backend-owned.
 
-## 16. Testing
+## 17. Testing
 
 The unit and integration suite runs offline: no key, no external network, no
 container.
@@ -543,17 +645,18 @@ Live checks that need a key, a browser or a paid call are opt-in and are not par
 of the default run. They use temporary databases, so they never touch your
 `.local/` data.
 
-## 17. Configuration
+## 18. Configuration
 
 Grouped by purpose. See `.env.example` for the full list.
 
 | Group | Variables |
 | --- | --- |
 | Provider | `LLM_PROVIDER`, `COMMANDCODE_API_KEY`, `COMMANDCODE_BASE_URL`, `COMMANDCODE_MODEL`, `COMMANDCODE_API_STYLE`, `COMMANDCODE_ZDR` |
-| Budgets | `MODEL_MAX_OUTPUT_TOKENS`, `MODEL_CONTEXT_WINDOW`, `TOOLLOOM_MAX_ITERATIONS`, `TOOLLOOM_MAX_TOOL_CALLS`, `TOOLLOOM_MAX_PARALLEL_TOOLS`, `TOOLLOOM_MAX_PAYLOAD_BYTES`, `TOOLLOOM_RUN_TIMEOUT_SECONDS` |
+| Budgets | `MODEL_MAX_OUTPUT_TOKENS`, `MODEL_CONTEXT_WINDOW`, `TOOLLOOM_MAX_ITERATIONS`, `TOOLLOOM_MAX_OUTPUT_CONTINUATIONS`, `TOOLLOOM_MAX_TOOL_CALLS`, `TOOLLOOM_RUN_TIMEOUT_SECONDS` |
 | Server | `TOOLLOOM_HOST`, `TOOLLOOM_PORT`, `TOOLLOOM_DATA_DIR` |
 | Capabilities | `TOOLLOOM_ALLOW_STDIO`, `TOOLLOOM_ALLOW_PYTHON`, `TOOLLOOM_PYTHON_TIMEOUT_SECONDS`, `TOOLLOOM_PYTHON_OUTPUT_BYTES` |
 | Tool Foundry | `TOOLLOOM_ALLOW_FOUNDRY`, `TOOLLOOM_FOUNDRY_TIMEOUT_SECONDS`, `TOOLLOOM_FOUNDRY_TEST_TIMEOUT_SECONDS`, `TOOLLOOM_FOUNDRY_OUTPUT_BYTES` |
+| Shell | `TOOLLOOM_ALLOW_SHELL`, `TOOLLOOM_SHELL_TIMEOUT_SECONDS`, `TOOLLOOM_SHELL_OUTPUT_BYTES` |
 | Search | `TOOLLOOM_SEARCH_PROVIDER`, `TOOLLOOM_SEARCH_URL`, `TOOLLOOM_SEARCH_MAX_RESULTS`, `TOOLLOOM_SEARCH_TIMEOUT_SECONDS` |
 | Behaviour | `TOOLLOOM_AUTO_TITLES`, `TOOLLOOM_SEED_DEMO` |
 | Vault | `TOOLLOOM_SECRETS_KEY` |
@@ -562,7 +665,7 @@ Grouped by purpose. See `.env.example` for the full list.
 Invalid enum values fail at startup. Cost figures appear only when you supply
 prices; token counts are always reported and no price is ever invented.
 
-## 18. Deliberate non-goals
+## 19. Deliberate non-goals
 
 Each of these was considered and left out on purpose. They are not oversights.
 

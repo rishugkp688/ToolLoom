@@ -20,6 +20,7 @@ from backend.repositories import MCPServerRepository, SkillRepository, ToolRepos
 from backend.runtime.observation import DEFAULT_MAX_CHARS, ExecutionResult, to_result
 from backend.services.mcp_connection_manager import MCPConnectionManager
 from backend.services.sandbox import ToolContext, workspace_for
+from backend.services.task_service import TaskService
 from backend.utils.errors import is_pre_send_error
 
 MAX_VALIDATION_ERRORS = 10
@@ -81,6 +82,19 @@ class ToolExecutor:
         # Handed to tools that change the catalogue themselves, such as
         # installing a generated capability.
         self.registry = registry
+
+    def effect_of(self, namespaced_name: str) -> str:
+        """The operator-controlled effect classification for a tool.
+
+        Returns ``unknown`` for anything unrecognised, which keeps the caller on the
+        safe path: no blind retry of an uncertain call, and no concurrency. A tool's
+        own description is not consulted — an MCP server calling itself read-only is
+        a statement of intent, not a guarantee.
+        """
+        with self.db.session() as session:
+            row = ToolRepository(session).get_by_namespaced(namespaced_name)
+            effect = getattr(row, "effect", None) if row is not None else None
+        return effect or "unknown"
 
     async def execute(self, call, conversation_id: str) -> ExecutionResult:
         started = time.perf_counter()
@@ -168,11 +182,16 @@ class ToolExecutor:
                 )
                 break
             except Exception as exc:
-                # Retry only when the request provably never reached the server.
-                if attempts < 2 and is_pre_send_error(exc):
+                # Retry only when the request provably never reached the server, and
+                # only for a read-only tool. A connection error raised while a session
+                # is being torn down can arrive after the tool already succeeded, so a
+                # mutation must never be replayed automatically.
+                effect = getattr(tool, "effect", "unknown") or "unknown"
+                pre_send = is_pre_send_error(exc)
+                if attempts < 2 and pre_send and effect == "read_only":
                     await asyncio.sleep(RETRY_BACKOFF_SECONDS)
                     continue
-                return to_result(
+                result = to_result(
                     call,
                     self._redact(f"{type(exc).__name__}: {exc}"),
                     is_error=True,
@@ -180,6 +199,9 @@ class ToolExecutor:
                     duration_ms=self._elapsed_ms(started),
                     max_chars=DEFAULT_MAX_CHARS,
                 )
+                # A timeout or dropped response does not prove the action failed.
+                result.outcome_uncertain = not pre_send and effect != "read_only"
+                return result
 
         result = to_result(
             call,
@@ -226,6 +248,7 @@ class ToolExecutor:
             secrets=self.secret_resolver,
             settings=self.settings,
             registry=self.registry,
+            tasks=TaskService(self.db, self.settings),
         )
 
     def _spill(self, conversation_id: str, result: ExecutionResult) -> None:

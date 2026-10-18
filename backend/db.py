@@ -78,6 +78,10 @@ class Database:
             "tools": {
                 "risk": "VARCHAR(16) DEFAULT 'low'",
                 "approved": "BOOLEAN DEFAULT 0",
+                "package_digest": "VARCHAR(64)",
+                # Defaults to unknown so unclassified tools stay sequential and are
+                # never blindly retried.
+                "effect": "VARCHAR(16) NOT NULL DEFAULT 'unknown'",
             },
             "messages": {
                 "user_text": "TEXT",
