@@ -4,6 +4,7 @@ from backend.models.conversation import Conversation
 from backend.models.mcp_server import MCPServer
 from backend.models.message import Message
 from backend.models.run import Run
+from backend.models.run_event import RunEvent, RunInput
 from backend.models.secret import Secret
 from backend.models.setting import Setting
 from backend.models.skill import Skill
@@ -16,6 +17,8 @@ __all__ = [
     "MCPServer",
     "Message",
     "Run",
+    "RunEvent",
+    "RunInput",
     "Secret",
     "Setting",
     "Skill",

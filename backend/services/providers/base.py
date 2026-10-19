@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -28,6 +28,11 @@ StopReason = Literal[
 
 class ProviderError(RuntimeError):
     """Raised for provider/transport failures. Never swallowed silently."""
+
+    def __init__(self, message: str, *, status: int = 502, category: str = "provider"):
+        super().__init__(message)
+        self.status = status
+        self.category = category
 
 
 @dataclass
@@ -234,11 +239,17 @@ class BaseProvider(ABC):
     async def list_models(self) -> list[ModelInfo]:
         raise NotImplementedError
 
-    async def complete(self, **kwargs: Any) -> ModelTurn:
+    async def complete(
+        self, *, usage_observer: Callable[[Usage], None] | None = None, **kwargs: Any
+    ) -> ModelTurn:
         turn: ModelTurn | None = None
         async for event in self.stream(**kwargs):
+            if isinstance(event, UsageEvent) and usage_observer is not None:
+                usage_observer(event.usage)
             if isinstance(event, MessageStopEvent):
                 turn = event.turn
+                if usage_observer is not None:
+                    usage_observer(turn.usage)
         if turn is None:
             raise ProviderError("provider produced no message-stop event")
         return turn

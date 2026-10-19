@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     commandcode_api_key: str | None = None
     commandcode_base_url: str = "https://api.commandcode.ai/provider/v1"
     commandcode_model: str = "deepseek/deepseek-v4-flash"
-    commandcode_api_style: str = "openai"
+    commandcode_api_style: str = "auto"
     commandcode_zdr: int = 0
 
     # Model budgeting

@@ -140,7 +140,19 @@ async def import_servers(request: Request, sync: bool = False) -> dict:
     if not raw.strip():
         raise HTTPException(status_code=400, detail="empty import body")
     try:
-        return _registry(request).import_config(raw, sync=sync)
+        result = _registry(request).import_config(raw, sync=sync)
+        if not result.get("applied"):
+            from fastapi.responses import JSONResponse
+
+            errors = [
+                f"{row['name']}: {row.get('error', 'invalid configuration')}"
+                for row in result.get("results", []) if not row.get("ok")
+            ]
+            return JSONResponse(status_code=400, content={
+                **result, "detail": "Nothing changed. " + "; ".join(errors),
+                "category": "mcp_config_validation",
+            })
+        return result
     except RegistryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:  # JSONDecodeError is a ValueError subclass

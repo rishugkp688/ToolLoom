@@ -8,7 +8,7 @@ router = APIRouter(tags=["meta"])
 
 
 @router.get("/health", response_model=HealthResponse)
-def health(request: Request) -> HealthResponse:
+async def health(request: Request) -> HealthResponse:
     settings = request.app.state.settings
     provider = request.app.state.provider
     return HealthResponse(

@@ -31,6 +31,7 @@ from backend.runtime.step_controller import StepController
 from backend.services.attempts import AttemptLedger, arguments_digest
 from backend.services.context_builder import UsageAnchor, anchor_for
 from backend.services.context_policy import ContextPolicy
+from backend.services.failures import failure_payload
 from backend.services.providers.base import (
     BaseProvider,
     MessageStopEvent,
@@ -46,6 +47,7 @@ from backend.services.providers.base import (
 )
 from backend.services.task_service import MAX_BLOCK_CHARS, TaskService
 from backend.utils.async_work import run_blocking
+from backend.utils.sqlite_retry import retry_sqlite_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +74,7 @@ class AgentRuntime:
         self.ledger = AttemptLedger(db)
 
     async def run_stream(
-        self, conversation_id: str, *, model_id: str | None = None
+        self, conversation_id: str, *, model_id: str | None = None, report_start: bool = False
     ) -> AsyncIterator[AgentEvent]:
         settings = self.settings
         model = model_id or self._default_model_id()
@@ -84,6 +86,8 @@ class AgentRuntime:
 
         controller = StepController()
         total_usage = Usage()
+        in_flight_usage = Usage()
+        persisted_turn = {"persisted": False}
         tool_trace: list[dict] = []
         reply = ""
         partial_text = ""
@@ -107,6 +111,8 @@ class AgentRuntime:
             unlimited, seen_call_ids, run_id = await run_blocking(
                 self._start_run, conversation_id, start_state
             )
+            if report_start:
+                yield AgentEvent("run_started", {"run_id": run_id})
             from backend.services.model_catalogue import budget_for
 
             budget = (
@@ -121,6 +127,9 @@ class AgentRuntime:
 
             while True:
                 iteration += 1
+                from backend.services import run_inputs
+
+                await run_blocking(run_inputs.deliver, self.db, conversation_id)
                 # Re-render the pinned state every iteration: plan_write can revise the
                 # objective or plan mid-run, and the next provider request must see it.
                 # A changed block also changes the system digest, which invalidates the
@@ -150,6 +159,8 @@ class AgentRuntime:
                 yield AgentEvent(ITERATION_START, {"iteration": iteration})
 
                 turn = None
+                in_flight_usage = Usage()
+                persisted_turn = {"persisted": False}
                 async for event in self.provider.stream(
                     messages=built.messages,
                     system=built.system,
@@ -168,9 +179,11 @@ class AgentRuntime:
                     elif isinstance(event, ToolCallDeltaEvent):
                         continue
                     elif isinstance(event, UsageEvent):
+                        in_flight_usage = event.usage
                         yield AgentEvent(USAGE, event.usage.to_dict())
                     elif isinstance(event, MessageStopEvent):
                         turn = event.turn
+                        in_flight_usage = turn.usage
 
                 if turn is None:
                     outcome = {
@@ -213,7 +226,7 @@ class AgentRuntime:
                 await run_blocking(self._canonicalize_calls, turn)
                 if finish_reason and not turn.tool_calls:
                     turn.stop_reason = finish_reason
-                await run_blocking(self._persist_assistant, conversation_id, turn)
+                await run_blocking(self._persist_assistant, conversation_id, turn, persisted_turn)
                 partial_text = ""
                 total_usage.input_tokens += turn.usage.input_tokens
                 total_usage.output_tokens += turn.usage.output_tokens
@@ -404,6 +417,8 @@ class AgentRuntime:
                 # max_tokens was handled above; anything else that is not a complete
                 # tool-use turn is the end of the run.
                 if turn.stop_reason != "tool_use" or not turn.tool_calls:
+                    if await run_blocking(run_inputs.pending, self.db, conversation_id):
+                        continue
                     break
 
                 for call in turn.tool_calls:
@@ -520,9 +535,10 @@ class AgentRuntime:
             if terminal_committed:
                 logger.error("Run failed after a terminal outcome (%s)", type(exc).__name__)
             else:
-                message = f"{type(exc).__name__}: {exc}"
-                if self.tool_executor is not None:
-                    message = self.tool_executor._redact(message)
+                logger.error("Run failed (%s)", type(exc).__name__)
+                failure = failure_payload(
+                    exc, self.tool_executor._redact if self.tool_executor else lambda value: value
+                )
                 outcome = {
                     "status": FAILED,
                     "stop_reason": "error",
@@ -530,8 +546,10 @@ class AgentRuntime:
                 }
                 terminal_committed = True
                 await run_blocking(self._record_failure, conversation_id, partial_text, "error")
-                yield AgentEvent(ERROR, {"message": message})
+                yield AgentEvent(ERROR, failure)
         finally:
+            if in_flight_usage.total_tokens and not persisted_turn["persisted"]:
+                await run_blocking(self._record_interrupted_usage, conversation_id, in_flight_usage)
             # Whatever happened — done, error, cancellation or the client vanishing —
             # the attempt is closed durably. This is what a resume reads.
             settled_id = run_id or start_state.get("run_id")
@@ -545,6 +563,7 @@ class AgentRuntime:
                     conversation_id,
                 )
 
+    @retry_sqlite_transaction
     def _start_run(self, conversation_id: str, state=None):
         with self.db.session() as session:
             unlimited = SettingRepository(session).get().unlimited_tools
@@ -558,6 +577,18 @@ class AgentRuntime:
             previous = RunRepository(session).last_settled(conversation_id)
             latest = repo.latest_user(conversation_id, include_resume=True)
             resume_id = previous.id if previous and latest and latest.is_resume else None
+            if latest and not latest.is_resume:
+                from sqlalchemy import update
+
+                from backend.models import RunInput
+                from backend.utils import utcnow
+
+                # New explicit input supersedes undelivered direction from an
+                # earlier run. Continue instead retains and delivers that input.
+                session.execute(update(RunInput).where(
+                    RunInput.conversation_id == conversation_id,
+                    RunInput.delivered_at.is_(None), RunInput.superseded_at.is_(None),
+                ).values(superseded_at=utcnow()))
         task = self.tasks.ensure(conversation_id, request=self._current_request(conversation_id))
         with self.db.session() as session:
             run_id = (
@@ -569,6 +600,7 @@ class AgentRuntime:
             state["run_id"] = run_id
         return unlimited, seen, run_id
 
+    @retry_sqlite_transaction
     def _settle_result(self, attempt_id, conversation_id, result):
         with self.db.session() as session:
             self.ledger.settle(
@@ -831,7 +863,28 @@ class AgentRuntime:
         lines.append("</resume_context>")
         return "\n".join(lines)
 
-    def _persist_assistant(self, conversation_id: str, turn) -> None:
+    def _record_interrupted_usage(self, conversation_id, usage):
+        from sqlalchemy import update
+
+        from backend.models import Conversation
+
+        try:
+            with self.db.session() as session:
+                session.execute(
+                    update(Conversation).where(Conversation.id == conversation_id).values(
+                        interrupted_usage_input=(
+                            Conversation.interrupted_usage_input + usage.input_tokens
+                        ),
+                        interrupted_usage_output=(
+                            Conversation.interrupted_usage_output + usage.output_tokens
+                        ),
+                    )
+                )
+        except Exception as exc:
+            logger.error("Could not save interrupted usage (%s)", type(exc).__name__)
+
+    @retry_sqlite_transaction
+    def _persist_assistant(self, conversation_id: str, turn, state=None) -> None:
         with self.db.session() as session:
             MessageRepository(session).add(
                 conversation_id=conversation_id,
@@ -846,7 +899,10 @@ class AgentRuntime:
             conversation = repo.get(conversation_id)
             if conversation is not None:
                 repo.touch(conversation)
+        if state is not None:
+            state["persisted"] = True
 
+    @retry_sqlite_transaction
     def _persist_tool_result(self, conversation_id: str, result: ExecutionResult) -> None:
         with self.db.session() as session:
             self._add_tool_result(session, conversation_id, result)

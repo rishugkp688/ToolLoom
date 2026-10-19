@@ -87,6 +87,12 @@
               <input type="checkbox" class="toggle-control" role="switch" id="unlimitedTools" aria-describedby="runModeHelp" disabled><span>Unlimited steps</span>
             </label>
             <span class="run-mode-help" id="runModeHelp">Enabled tools only · timeouts still apply</span>
+            <label class="check switch-label" title="Run continues if you close this tab; Stop still cancels it">
+              <input type="checkbox" id="keepRunning"><span>Keep running when disconnected</span>
+            </label>
+            <button class="btn btn-quiet" id="attachRunBtn" type="button" hidden>Attach to running task</button>
+            <button class="btn btn-quiet" id="detachRunBtn" type="button" hidden>Detach</button>
+            <button class="btn btn-quiet" id="steerRunBtn" type="button" hidden>Send direction</button>
           </div>
           <p class="composer-hint" id="composerHint"><span id="modelContext" aria-live="polite">Reading model context…</span><span>Enter to send <span aria-hidden="true">·</span> Shift + Enter for a new line</span></p>
         </div>

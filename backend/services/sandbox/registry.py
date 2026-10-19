@@ -54,6 +54,8 @@ class ToolContext:
     # Durable task state (objective, plan, completion criteria). The plan tools read
     # and revise it; the runtime pins it into the system prompt.
     tasks: Any = None
+    # Backend-only data for redacting captures before they reach disk.
+    output_secrets: tuple[str, ...] = ()
 
     def workspace(self) -> Workspace:
         return workspace_for(self.workspaces_dir, self.conversation_id)
@@ -83,8 +85,11 @@ EFFECTS: dict[str, str] = {
     "sandbox__plan_read": "read_only",
     "sandbox__plan_write": "idempotent",
     "sandbox__fs_write": "mutating",
+    "sandbox__fs_edit": "mutating",
+    "sandbox__repo_instructions": "read_only",
     "sandbox__fs_delete": "mutating",
-    "sandbox__http_fetch": "idempotent",
+    # The public contract includes POST/PATCH/DELETE; interrupted effects are unknown.
+    "sandbox__http_fetch": "mutating",
     "sandbox__web_search": "idempotent",
     "demo__add": "read_only",
     # python, shell and the foundry tools stay unknown: they execute arbitrary code,
@@ -114,6 +119,16 @@ def _fs_read(arguments: dict[str, Any], ctx: ToolContext) -> str:
 
 def _fs_write(arguments: dict[str, Any], ctx: ToolContext) -> str:
     return fs_tool.write(ctx.workspace(), arguments)
+
+
+def _fs_edit(arguments: dict[str, Any], ctx: ToolContext) -> str:
+    return fs_tool.edit(ctx.workspace(), arguments)
+
+
+def _repo_instructions(arguments: dict[str, Any], ctx: ToolContext) -> str:
+    from backend.services.repository_instructions import discover
+
+    return json.dumps({"files": discover(ctx.workspace(), arguments.get("path") or ".")})
 
 
 def _fs_list(arguments: dict[str, Any], ctx: ToolContext) -> str:
@@ -338,7 +353,9 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
             description=(
                 "Run Python in the conversation workspace. Executes with host OS "
                 "permissions, NOT sandboxed. Requires operator opt-in and approval. "
-                "Use print() for output; standard library and installed packages are available."
+                "Use print() for output; standard library and installed packages are available. "
+                "Timeout is capped by operator settings; the result reports its effective value. "
+                "Read output_captures paths with fs_read to retrieve omitted output."
             ),
             input_schema={
                 "type": "object",
@@ -361,9 +378,12 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
                 "your work actually passes. Runs through a real shell with host OS "
                 "permissions, NOT sandboxed, so use the narrowest command that "
                 "answers the question and pass non-interactive flags. A pipeline "
-                "reports the first failing command's status, so `tests | tail` still "
-                "tells you the tests failed. The default working directory is the "
-                "conversation workspace. Requires operator opt-in and approval."
+                "under Bash uses pipefail to retain upstream failures; exit 141 may "
+                "mean an early-closed writer. The result reports shell, pipeline policy "
+                "and the operator-capped effective timeout. Foreground descendants are "
+                "stopped; '&' does not create a persistent background job. Read "
+                "output_captures paths with fs_read for omitted output. The default "
+                "working directory is the conversation workspace. Requires opt-in and approval."
             ),
             input_schema={
                 "type": "object",
@@ -383,7 +403,8 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
         ),
         SandboxTool(
             name="fs_read",
-            description="Read a text file from this conversation's workspace.",
+            description=("Read workspace text, including output capture paths. Paged output is "
+                         "bounded; use offset/column from a truncation footer to continue."),
             input_schema={
                 "type": "object",
                 "properties": {
@@ -394,6 +415,12 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
                         "description": "1-based first line",
                     },
                     "limit": {"type": "integer", "minimum": 1, "description": "number of lines"},
+                    "column": {"type": "integer", "minimum": 1,
+                               "description": "1-based character in the first requested line"},
+                    "with_metadata": {
+                        "type": "boolean",
+                        "description": "Full-file read returns JSON with sha256 for fs_edit",
+                    },
                 },
                 "required": ["path"],
                 "additionalProperties": False,
@@ -423,6 +450,39 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
                 "additionalProperties": False,
             },
             handler=_fs_write,
+        ),
+        SandboxTool(
+            name="fs_edit",
+            description=(
+                "Replace one unique exact text fragment in an existing UTF-8 workspace file. "
+                "Read with fs_read(with_metadata=true) first and provide its sha256. "
+                "Refuses stale revisions and ambiguous matches; preserves other content."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": _PATH,
+                    "old_text": {"type": "string", "minLength": 1},
+                    "new_text": {"type": "string"},
+                    "expected_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+                },
+                "required": ["path", "old_text", "new_text", "expected_sha256"],
+                "additionalProperties": False,
+            },
+            handler=_fs_edit,
+        ),
+        SandboxTool(
+            name="repo_instructions",
+            description=(
+                "Discover AGENTS.md and CLAUDE.md from workspace root to a target file's "
+                "directory, in that order. Read before editing a nested directory; deeper "
+                "instructions apply only within that directory. Results are bounded."
+            ),
+            input_schema={
+                "type": "object", "properties": {"path": _PATH},
+                "additionalProperties": False,
+            },
+            handler=_repo_instructions,
         ),
         SandboxTool(
             name="fs_list",
@@ -481,7 +541,9 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
             name="http_fetch",
             description=(
                 "Fetch a public http(s) URL. Private/loopback hosts are refused; "
-                "high-risk and disabled until an operator enables and approves it."
+                "connections are pinned with TLS hostname checks. Cross-origin redirects "
+                "with caller headers or mutations are refused. Mutating methods may have "
+                "effects even if a response fails. High-risk; requires operator approval."
             ),
             input_schema={
                 "type": "object",
@@ -618,7 +680,7 @@ def dispatch(server_name: str, tool_name: str, arguments: dict[str, Any], ctx: T
         raise SandboxError(f"unknown local tool {server_name}__{tool_name}")
     try:
         result = tool.handler(arguments, ctx)
-    except SandboxError:
+    except (SandboxError, ToolPreflightError):
         raise
     except Exception as exc:  # convert handler bugs into reasoned tool errors
         raise SandboxError(f"{type(exc).__name__}: {exc}") from exc

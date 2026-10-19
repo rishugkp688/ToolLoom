@@ -6,12 +6,16 @@ import asyncio
 import logging
 from datetime import timedelta
 
+from sqlalchemy import or_, update
+
+from backend.models import Conversation
 from backend.repositories import ConversationRepository, MessageRepository
 from backend.services.conversation_service import title_from_message
 from backend.services.providers.base import ProviderMessage, TextBlock
 from backend.services.uploads import legacy_attachment_presentation
 from backend.utils import utcnow
 from backend.utils.async_work import run_blocking
+from backend.utils.sqlite_retry import retry_sqlite_transaction
 
 TITLE_PROMPT = (
     "Generate a short conversation title (2 to 6 words) describing the topic of the exchange. "
@@ -75,6 +79,7 @@ class ConversationTitles:
             self._store, conversation_id, old_title, title, error, usage_in, usage_out
         )
 
+    @retry_sqlite_transaction
     def _prepare(self, conversation_id):
         with self.db.session() as session:
             conv = ConversationRepository(session).get(conversation_id)
@@ -108,13 +113,31 @@ class ConversationTitles:
                 conv.title_source = "manual"
                 return
             old_title = conv.title
-            conv.title_attempts += 1
-            conv.title_last_attempt = now
             prompt = f"User: {text[:2000]}"
             if files:
                 prompt += "\nAttached files: " + ", ".join(file["name"] for file in files)[:500]
             if answer:
                 prompt += f"\nAssistant: {answer.content[:1000]}"
+            # Start/end metadata tasks may overlap. Reserve the attempt with one
+            # conditional increment, not a read-modify-write of a stale ORM row.
+            reserved = session.execute(
+                update(Conversation)
+                .where(
+                    Conversation.id == conversation_id,
+                    Conversation.title_source.in_(ELIGIBLE_SOURCES),
+                    Conversation.title == old_title,
+                    Conversation.title_attempts < TITLE_MAX_ATTEMPTS,
+                    or_(
+                        Conversation.title_last_attempt.is_(None),
+                        Conversation.title_last_attempt
+                        <= now - timedelta(seconds=TITLE_RETRY_SECONDS),
+                    ),
+                )
+                .values(title_attempts=Conversation.title_attempts + 1, title_last_attempt=now),
+                execution_options={"synchronize_session": False},
+            )
+            if reserved.rowcount != 1:
+                return
 
         return old_title, prompt
 

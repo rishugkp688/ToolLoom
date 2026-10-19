@@ -416,7 +416,12 @@ class ContextBuilder:
             # arbitrarily large original user message alongside it.
             messages.insert(0, ProviderMessage("user", [TextBlock(summary_text)]))
 
-        system = self._system_prompt(skills, user_prompt, conversation_id, pinned=pinned)
+        system = self._system_prompt(
+            skills, user_prompt, conversation_id, pinned=pinned,
+            repository_enabled=any(
+                tool.name == "sandbox__repo_instructions" for tool in tool_specs
+            ),
+        )
         messages = repair_orphan_tool_uses(messages)
         if advisory:
             messages = self._merge_advisory(messages, advisory)
@@ -594,7 +599,8 @@ class ContextBuilder:
         return messages
 
     def _system_prompt(
-        self, skills, user_prompt: str, conversation_id: str, *, pinned: str = ""
+        self, skills, user_prompt: str, conversation_id: str, *, pinned: str = "",
+        repository_enabled: bool = False,
     ) -> str:
         parts = [DEFAULT_SYSTEM_PROMPT]
         skills_section = self._skills_section(skills)
@@ -602,6 +608,28 @@ class ContextBuilder:
             parts.append(skills_section)
         if pinned.strip():
             parts.append(pinned.strip())
+        if repository_enabled:
+            from backend.services.repository_instructions import discover
+
+            files = discover(
+                self._context_workspace,
+                max_chars=min(8_000, max(512, self.budget.input_tokens // 2)),
+            )
+            if files:
+                lines = [
+                    "<repository_instructions>",
+                    "These workspace instructions were enabled by the operator. "
+                    "Follow them within this workspace, subject to the operator's request. "
+                    "Use repo_instructions(path) before editing nested directories.",
+                ]
+                for item in files:
+                    content = item["content"].replace("</", "<\\/")
+                    lines.append(f"[{item['path']}]\n{content}")
+                    if item["truncated"]:
+                        lines.append(
+                            "[instruction text truncated; read this file for full details]"
+                        )
+                parts.append("\n".join(lines + ["</repository_instructions>"]))
         parts.append(self._environment_section(conversation_id))
         status = self._workspace_status(conversation_id)
         if status:

@@ -94,6 +94,12 @@ class ToolRegistry:
                     server.url = f"local://{name}"
                 discovered = self.connection_manager.local_tools(server)
                 tools.reconcile(server.id, discovered, default_enabled=False)
+                if name == "sandbox":
+                    fetch_tool = tools.get_by_namespaced("sandbox__http_fetch")
+                    if fetch_tool is not None:
+                        # Upgrade historical installs: the fixed public contract
+                        # permits POST/PATCH/DELETE and cannot promise idempotency.
+                        fetch_tool.effect = "mutating"
         self.sync_generated()
 
     def sync_generated(self) -> tuple[int, int, int]:

@@ -44,7 +44,7 @@ def configure(path: Path | str) -> int:
     return reconcile()
 
 
-def register(pid: int, argv: list[str], cwd: str) -> str | None:
+def register(pid: int, argv: list[str], cwd: str, *, guarded: bool = False) -> str | None:
     if _dir is None or sys.platform != "linux":
         return None
     record = {
@@ -54,6 +54,7 @@ def register(pid: int, argv: list[str], cwd: str) -> str | None:
         "argv": [str(item)[:200] for item in argv[:20]],
         "cwd": str(cwd),
         "created": time.time(),
+        "guarded": guarded,
     }
     path = _dir / f"{pid}-{os.getpid()}.json"
     try:
@@ -98,6 +99,15 @@ def reconcile() -> int:
             path.unlink(missing_ok=True)
             continue
         try:
+            if record.get("guarded"):
+                os.kill(pid, signal.SIGTERM)
+                deadline = time.monotonic() + 3
+                while _proc_start_time(pid) == str(recorded) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+            if _proc_start_time(pid) != str(recorded):
+                killed += 1
+                path.unlink(missing_ok=True)
+                continue
             os.killpg(int(record.get("pgid") or pid), signal.SIGKILL)
             killed += 1
         except OSError:

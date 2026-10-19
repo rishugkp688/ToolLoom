@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field
+from pydantic import ConfigDict, Field, StrictBool
 
 from backend.schemas.safe import SafeModel
 
@@ -18,8 +18,9 @@ class SkillToggle(SafeModel):
 
 
 class SettingsIn(SafeModel):
-    system_prompt: str | None = None
-    unlimited_tools: bool | None = None
+    model_config = ConfigDict(extra="forbid")
+    system_prompt: str | None = Field(default=None, max_length=64_000)
+    unlimited_tools: StrictBool | None = None
 
 
 class AttachmentRef(SafeModel):

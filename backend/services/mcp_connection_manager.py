@@ -26,8 +26,6 @@ from backend.services.mcp_client import (
     list_tools_on,
     open_session,
 )
-from backend.services.mcp_client import call_tool as mcp_call_tool
-from backend.services.mcp_client import list_tools as mcp_list_tools
 from backend.services.sandbox import dispatch as sandbox_dispatch
 from backend.services.sandbox import effects_for as sandbox_effects_for
 from backend.services.sandbox import tools_for as sandbox_tools_for
@@ -199,10 +197,9 @@ class _SessionHandle:
 class _SessionPool:
     """Supervised sessions that outlive one tool call.
 
-    A stateful stdio server keeps counters, handles and open documents in its
-    process. Opening one per call threw all of that away, so the next turn saw a
-    fresh server. Entries are keyed by server identity plus configuration, and are
-    closed on invalidation or shutdown.
+    Stateful stdio, HTTP and SSE servers can keep counters, handles and open
+    documents in a session. Entries are keyed by server identity plus configuration
+    and closed on invalidation or shutdown. Failed operations are never replayed here.
     """
 
     def __init__(self) -> None:
@@ -403,38 +400,27 @@ class MCPConnectionManager:
         if transport in {"http", "sse", "stdio"}:
             if transport in {"http", "sse"} and not server.url:
                 raise MCPError(f"server {server.name!r} has no url")
-            if transport == "stdio":
-                key = self._session_key(server)
+            key = self._session_key(server)
 
-                deadline = asyncio.get_running_loop().time() + server.timeout_ms / 1000
+            deadline = asyncio.get_running_loop().time() + server.timeout_ms / 1000
 
-                async def discover(session):
-                    async with asyncio.timeout_at(deadline):
-                        return await list_tools_on(session)
+            async def discover(session):
+                async with asyncio.timeout_at(deadline):
+                    return await list_tools_on(session)
 
-                try:
-                    async with asyncio.timeout_at(deadline):
-                        handle = await self._pooled_session(server)
-                        tools = await handle.run(discover)
-                except asyncio.CancelledError:
-                    await self._pool.invalidate(key)
-                    raise
-                except MCPError:
-                    await self._pool.invalidate(key)
-                    raise
-                except Exception as exc:
-                    await self._pool.invalidate(key)
-                    raise MCPError(str(exc), stage="dispatch") from exc
-            else:
-                extra = {}
-                tools = await mcp_list_tools(
-                    url=server.url,
-                    headers=self._headers(server),
-                    timeout_ms=server.timeout_ms,
-                    verify_ssl=server.verify_ssl,
-                    transport=transport,
-                    **extra,
-                )
+            try:
+                async with asyncio.timeout_at(deadline):
+                    handle = await self._pooled_session(server)
+                    tools = await handle.run(discover)
+            except asyncio.CancelledError:
+                await self._pool.invalidate(key)
+                raise
+            except MCPError:
+                await self._pool.invalidate(key)
+                raise
+            except Exception as exc:
+                await self._pool.invalidate(key)
+                raise MCPError(str(exc), stage="dispatch") from exc
             return [
                 {
                     "name": tool.name,
@@ -487,49 +473,37 @@ class MCPConnectionManager:
         if transport in {"http", "sse", "stdio"}:
             if transport in {"http", "sse"} and not server.url:
                 raise MCPError(f"server {server.name!r} has no url")
-            if transport == "stdio":
-                key = self._session_key(server)
+            key = self._session_key(server)
 
-                deadline = asyncio.get_running_loop().time() + server.timeout_ms / 1000
-                dispatched = False
+            deadline = asyncio.get_running_loop().time() + server.timeout_ms / 1000
+            dispatched = False
 
-                async def call(session):
-                    nonlocal dispatched
-                    async with asyncio.timeout_at(deadline):
-                        dispatched = True
-                        return await call_tool_on(session, tool_name, arguments)
+            async def call(session):
+                nonlocal dispatched
+                async with asyncio.timeout_at(deadline):
+                    dispatched = True
+                    return await call_tool_on(session, tool_name, arguments)
 
-                try:
-                    async with asyncio.timeout_at(deadline):
-                        handle = await self._pooled_session(server)
-                        return await handle.run(call)
-                except asyncio.CancelledError:
-                    await self._pool.invalidate(key)
-                    raise
-                except MCPError as exc:
-                    await self._pool.invalidate(key)
-                    if not dispatched:
-                        raise MCPError(str(exc), stage="pre_send") from exc
-                    raise
-                except Exception as exc:
-                    # A broken or timed-out session is not safe to reuse. Close it
-                    # so the next call reconnects; never replay the call itself.
-                    await self._pool.invalidate(key)
-                    raise MCPError(
-                        str(exc) or type(exc).__name__,
-                        stage="dispatch" if dispatched else "pre_send",
-                    ) from exc
-            extra = {}
-            return await mcp_call_tool(
-                url=server.url,
-                headers=self._headers(server),
-                timeout_ms=server.timeout_ms,
-                verify_ssl=server.verify_ssl,
-                transport=transport,
-                tool_name=tool_name,
-                arguments=arguments,
-                **extra,
-            )
+            try:
+                async with asyncio.timeout_at(deadline):
+                    handle = await self._pooled_session(server)
+                    return await handle.run(call)
+            except asyncio.CancelledError:
+                await self._pool.invalidate(key)
+                raise
+            except MCPError as exc:
+                await self._pool.invalidate(key)
+                if not dispatched:
+                    raise MCPError(str(exc), stage="pre_send") from exc
+                raise
+            except Exception as exc:
+                # A broken or timed-out session is not safe to reuse. Close it
+                # so the next call reconnects; never replay the call itself.
+                await self._pool.invalidate(key)
+                raise MCPError(
+                    str(exc) or type(exc).__name__,
+                    stage="dispatch" if dispatched else "pre_send",
+                ) from exc
         raise MCPError(f"unsupported transport {transport!r}")
 
     async def test_connection(self, server) -> dict[str, Any]:

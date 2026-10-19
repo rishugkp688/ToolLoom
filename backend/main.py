@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,13 +36,14 @@ from backend.api import (
 )
 from backend.config import Settings
 from backend.db import Database
-from backend.repositories import RunRepository, ToolAttemptRepository
+from backend.repositories import RunRepository, SettingRepository, ToolAttemptRepository
 from backend.runtime import AgentRuntime
 from backend.services.context_compactor import ContextCompactor
 from backend.services.conversation_titles import ConversationTitles
 from backend.services.mcp_connection_manager import MCPConnectionManager
 from backend.services.model_catalogue import ModelCatalogue
 from backend.services.providers import build_provider
+from backend.services.run_supervisor import RunSupervisor
 from backend.services.secret_service import SecretService
 from backend.services.secrets import DbResolver, Vault, load_or_generate_key
 from backend.services.skill_service import SkillService
@@ -112,12 +113,17 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
         settings.database_url, busy_timeout_seconds=settings.toolloom_db_busy_timeout_seconds
     )
     db.create_all()
+    with db.session() as session:
+        SettingRepository(session).get()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         try:
             yield
         finally:
+            supervisor = getattr(_app.state, "run_supervisor", None)
+            if supervisor is not None:
+                await supervisor.aclose()
             manager = getattr(_app.state, "mcp_connection_manager", None)
             if manager is not None:
                 try:
@@ -129,6 +135,14 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
             db.dispose()
 
     app = FastAPI(title="ToolLoom", version=settings.version, lifespan=lifespan)
+
+    @app.exception_handler(HTTPException)
+    async def http_error_handler(_request: Request, exc: HTTPException):
+        content = {"detail": exc.detail}
+        category = (exc.headers or {}).get("X-ToolLoom-Error")
+        if category:
+            content["category"] = category
+        return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(_request: Request, exc: RequestValidationError):
@@ -147,6 +161,7 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
     app.state.settings = settings
     app.state.db = db
     app.state.active_runs = set()
+    app.state.run_supervisor = RunSupervisor(db, app.state.active_runs)
     app.state.provider = provider or build_provider(settings)
     app.state.model_catalogue = ModelCatalogue(app.state.provider, settings)
 
@@ -217,9 +232,16 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
         except Exception as exc:
             # Avoid logging arbitrary exception strings, which may contain credentials.
             logging.getLogger(__name__).error("Request failed (%s)", type(exc).__name__)
+            from backend.services.failures import failure_payload
+
+            failure = failure_payload(exc)
+            message = (
+                "Internal server error. Check backend storage and retry."
+                if failure["category"] == "internal" else failure["message"]
+            )
             return JSONResponse(
-                status_code=500,
-                content={"detail": "Internal server error. Check backend storage and retry."},
+                status_code=failure["status"],
+                content={"detail": message, "category": failure["category"]},
             )
 
     app.include_router(health.router)

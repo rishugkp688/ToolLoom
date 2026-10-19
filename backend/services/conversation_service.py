@@ -7,6 +7,7 @@ import json
 from backend.repositories import ConversationRepository, MessageRepository
 from backend.services.providers.base import TextBlock, blocks_to_dicts
 from backend.services.uploads import legacy_attachment_presentation
+from backend.utils.sqlite_retry import retry_sqlite_transaction
 
 
 def title_from_message(text: str, limit: int = 60) -> str:
@@ -45,6 +46,7 @@ class ConversationService:
         self.db = db
         self.settings = settings
 
+    @retry_sqlite_transaction
     def create(self, title: str | None = None) -> dict:
         with self.db.session() as session:
             conversation = ConversationRepository(session).create(title)
@@ -64,13 +66,18 @@ class ConversationService:
                 return None
             return _summary(session, conversation)
 
-    def get(self, conversation_id: str) -> dict | None:
+    def get(
+        self, conversation_id: str, *, limit: int = 100, before: str | None = None
+    ) -> dict | None:
         with self.db.session() as session:
             conversation = ConversationRepository(session).get(conversation_id)
             if conversation is None:
                 return None
             message_repo = MessageRepository(session)
             detail = _summary(session, conversation)
+            rows, has_more = message_repo.page(conversation_id, limit=limit, before=before)
+            detail["has_more"] = has_more
+            detail["next_before"] = rows[0].id if rows and has_more else None
             detail["messages"] = [
                 {
                     "id": row.id,
@@ -83,14 +90,16 @@ class ConversationService:
                     "stop_reason": row.stop_reason,
                     **_presentation(row),
                 }
-                for row in message_repo.list_by_conversation(conversation_id)
+                for row in rows
             ]
             return detail
 
+    @retry_sqlite_transaction
     def delete(self, conversation_id: str) -> bool:
         with self.db.session() as session:
             return ConversationRepository(session).delete(conversation_id)
 
+    @retry_sqlite_transaction
     def add_user_message(
         self,
         conversation_id: str,

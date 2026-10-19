@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request
 
 from backend.schemas import ModelInfo
+from backend.services.failures import failure_payload
 from backend.services.model_catalogue import budget_for
 
 router = APIRouter(tags=["meta"])
@@ -13,10 +14,10 @@ async def list_models(request: Request) -> list[ModelInfo]:
     try:
         infos = await request.app.state.model_catalogue.list()
     except Exception as exc:  # surface provider failures precisely
+        failure = failure_payload(exc, request.app.state.tool_executor._redact)
         raise HTTPException(
-            status_code=502,
-            detail="model catalogue unavailable: "
-            + request.app.state.tool_executor._redact(str(exc)),
+            status_code=failure["status"], detail=failure["message"],
+            headers={"X-ToolLoom-Error": failure["category"]},
         ) from exc
     result = []
     for info in infos:

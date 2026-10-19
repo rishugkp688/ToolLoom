@@ -14,7 +14,12 @@ class UsageService:
         with self.db.session() as session:
             rows = MessageRepository(session).usage_by_conversation()
             title_usage = {
-                row.id: (row.title_usage_input, row.title_usage_output)
+                row.id: (
+                    (row.title_usage_input + row.compaction_usage_input
+                     + row.interrupted_usage_input),
+                    (row.title_usage_output + row.compaction_usage_output
+                     + row.interrupted_usage_output),
+                )
                 for row in ConversationRepository(session).list()
             }
 
@@ -36,6 +41,12 @@ class UsageService:
             }
 
         return {
+            "accounting": {
+                "basis": "provider_reported",
+                "includes": ["transcript", "titles", "compaction", "reported_interrupted_usage"],
+                "limitation": "Requests with no provider usage report cannot be counted exactly.",
+                "context_budgeting": "character estimate calibrated by provider prompt usage",
+            },
             "global_": {
                 "input_tokens": total_in,
                 "output_tokens": total_out,

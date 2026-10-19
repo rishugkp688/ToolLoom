@@ -6,11 +6,12 @@ import io
 import json
 import logging
 import zipfile
+from contextlib import aclosing
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from backend.runtime.events import DONE, AgentEvent
 from backend.schemas import (
@@ -131,7 +132,7 @@ async def _start(
         raise
 
 
-async def _events(request, conversation_id, model_id):
+async def _events(request, conversation_id, model_id, *, report_start=False):
     finished = None
     # Name the conversation now, from the first message, rather than after the run.
     # A run that takes minutes used to leave the provisional title on screen the whole
@@ -139,26 +140,34 @@ async def _events(request, conversation_id, model_id):
     _schedule_title(request, conversation_id, model_id)
     try:
         async with asyncio.timeout(request.app.state.settings.toolloom_run_timeout_seconds):
-            async for event in request.app.state.runtime.run_stream(
-                conversation_id, model_id=model_id
-            ):
-                if event.kind == DONE:
-                    finished = event
-                else:
-                    yield event
+            options = {"report_start": True} if report_start else {}
+            async with aclosing(request.app.state.runtime.run_stream(
+                conversation_id, model_id=model_id, **options
+            )) as source:
+                async for event in source:
+                    if event.kind == DONE:
+                        finished = event
+                    else:
+                        if event.kind == "error":
+                            event = AgentEvent("error", {
+                                "status": 502, "category": "provider_protocol", **event.data,
+                            })
+                        yield event
     except TimeoutError:
         yield AgentEvent(
             "error",
             {
                 "message": "Run time limit reached. You can continue the conversation.",
                 "status": 504,
+                "category": "run_timeout",
             },
         )
     except Exception as exc:
         logger.error("Run boundary failed (%s)", type(exc).__name__)
         yield AgentEvent(
             "error",
-            {"message": "Run failed unexpectedly. Retry or check backend storage.", "status": 500},
+            {"message": "Run failed unexpectedly. Retry or check backend storage.",
+             "status": 500, "category": "internal"},
         )
     if finished is not None:
         # The client gets its terminal event first. Title generation is metadata and
@@ -186,6 +195,7 @@ async def _drain(request, conversation_id, model_id):
         raise HTTPException(
             status_code=failure.get("status", 502),
             detail=failure.get("message", "agent produced no result"),
+            headers={"X-ToolLoom-Error": failure.get("category", "provider")},
         )
     return final
 
@@ -196,8 +206,9 @@ class _RunResponse(StreamingResponse):
         self.conversation_id = conversation_id
 
         async def source():
-            async for event in _events(request, conversation_id, model_id):
-                yield _sse(event)
+            async with aclosing(_events(request, conversation_id, model_id)) as events:
+                async for event in events:
+                    yield _sse(event)
 
         super().__init__(source(), media_type="text/event-stream", headers=SSE_HEADERS)
 
@@ -231,8 +242,15 @@ def get_conversation_meta(conversation_id: str, request: Request) -> dict:
 
 
 @router.get("/{conversation_id}", response_model=ConversationDetail)
-def get_conversation(conversation_id: str, request: Request) -> dict:
-    detail = _service(request).get(conversation_id)
+def get_conversation(
+    conversation_id: str, request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    before: str | None = Query(default=None, min_length=1, max_length=36),
+) -> dict:
+    try:
+        detail = _service(request).get(conversation_id, limit=limit, before=before)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if detail is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     return detail
@@ -293,13 +311,156 @@ async def continue_stream(conversation_id: str, request: Request, model_id: str 
     return _RunResponse(request, conversation_id, model_id)
 
 
+# --- supervised runs: disconnecting a reader never cancels execution ----------
+
+@router.post("/{conversation_id}/runs", status_code=202)
+async def start_supervised_run(
+    conversation_id: str, request: Request, body: SendMessageRequest | None = None,
+    resume: bool = False, model_id: str | None = None,
+):
+    from backend.services.run_supervisor import RunStartFailed
+
+    if not resume and body is None:
+        raise HTTPException(status_code=422, detail="message body required")
+    if await run_blocking(_service(request).meta, conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if resume:
+        await _start(request, conversation_id, CONTINUE_PROMPT, is_resume=True)
+    else:
+        text, attachments = await run_blocking(
+            _with_attachments, request, conversation_id, body.message, body.attachments
+        )
+        await _start(
+            request, conversation_id, text, user_text=body.message, attachments=attachments
+        )
+        model_id = body.model_id or model_id
+    try:
+        run_id = await request.app.state.run_supervisor.start(
+            conversation_id, _events(request, conversation_id, model_id, report_start=True)
+        )
+    except RunStartFailed as exc:
+        raise HTTPException(
+            status_code=exc.payload["status"], detail=exc.payload["message"],
+            headers={"X-ToolLoom-Error": exc.payload["category"]},
+        ) from exc
+    return {
+        "run_id": run_id,
+        "events_url": f"/conversations/{conversation_id}/runs/{run_id}/events",
+    }
+
+
+@router.get("/{conversation_id}/runs/active")
+async def active_supervised_run(conversation_id: str, request: Request):
+    if await run_blocking(_service(request).meta, conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    handle = request.app.state.run_supervisor.live(conversation_id)
+    return {"run_id": handle.run_id if handle else None}
+
+
+async def _supervised_info(request, conversation_id, run_id):
+    info = await run_blocking(request.app.state.run_supervisor.info, conversation_id, run_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return info
+
+
+@router.get("/{conversation_id}/runs/{run_id}")
+async def supervised_run_info(conversation_id: str, run_id: str, request: Request):
+    return await _supervised_info(request, conversation_id, run_id)
+
+
+@router.get("/{conversation_id}/runs/{run_id}/events")
+async def attach_run(
+    conversation_id: str, run_id: str, request: Request,
+    after: int = Query(default=0, ge=0, le=2**63 - 1),
+):
+    info = await _supervised_info(request, conversation_id, run_id)
+    if not info["replay_available"]:
+        raise HTTPException(status_code=409, detail="this run has no supervised event journal")
+    header = request.headers.get("last-event-id")
+    if header is not None:
+        try:
+            header_cursor = int(header)
+            if header_cursor < 0:
+                raise ValueError
+            after = max(after, header_cursor)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid Last-Event-ID") from exc
+    if after > info["last_event_sequence"]:
+        raise HTTPException(status_code=422, detail="cursor is beyond the saved event journal")
+    supervisor = request.app.state.run_supervisor
+
+    async def source():
+        cursor = after
+        heartbeat = asyncio.get_running_loop().time()
+        while True:
+            rows = await run_blocking(supervisor.read, run_id, cursor)
+            for sequence, event in rows:
+                cursor = sequence
+                yield f"id: {sequence}\n{_sse(event)}"
+                if event.kind in {"done", "error"}:
+                    return
+            if rows:
+                continue
+            if not supervisor.live(conversation_id, run_id):
+                # Final journal commits precede release of run ownership. Recheck
+                # once after observing release to close the empty-read race.
+                rows = await run_blocking(supervisor.read, run_id, cursor)
+                if rows:
+                    continue
+                info = await _supervised_info(request, conversation_id, run_id)
+                if info["status"] in {"interrupted", "running"}:
+                    yield _sse(AgentEvent("error", {
+                        "message": "Run interrupted; inspect saved state before Continue.",
+                        "category": "run_interrupted", "status": 409,
+                    }))
+                elif info["last_event_kind"] not in {"done", "error"}:
+                    yield _sse(AgentEvent("error", {
+                        "message": "Final progress event was not saved. Check the transcript.",
+                        "category": "event_storage", "status": 500,
+                    }))
+                return
+            if asyncio.get_running_loop().time() - heartbeat >= 15:
+                heartbeat = asyncio.get_running_loop().time()
+                yield ": keep-alive\n\n"
+            await asyncio.sleep(0.1)
+
+    return StreamingResponse(source(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+@router.post("/{conversation_id}/runs/{run_id}/cancel", status_code=202)
+async def cancel_supervised_run(conversation_id: str, run_id: str, request: Request):
+    await _supervised_info(request, conversation_id, run_id)
+    if not request.app.state.run_supervisor.cancel(conversation_id, run_id):
+        raise HTTPException(status_code=409, detail="run is not live in this backend")
+    return {"run_id": run_id, "cancel_requested": True}
+
+
+class SteeringInput(SafeModel):
+    model_config = ConfigDict(extra="forbid")
+    message: str = Field(min_length=1, max_length=64_000, pattern=r"\S")
+
+
+@router.post("/{conversation_id}/runs/{run_id}/steer", status_code=202)
+async def steer_supervised_run(
+    conversation_id: str, run_id: str, body: SteeringInput, request: Request,
+):
+    await _supervised_info(request, conversation_id, run_id)
+    supervisor = request.app.state.run_supervisor
+    if not supervisor.live(conversation_id, run_id):
+        raise HTTPException(status_code=409, detail="run is not live in this backend")
+    input_id = await run_blocking(supervisor.steer, conversation_id, run_id, body.message)
+    return {"id": input_id, "queued": True,
+            "delivery": "next model request, or Continue if the run has already stopped"}
+
+
 # --- files & workspace -------------------------------------------------------
 
 
 @router.get("/{conversation_id}/task")
 def get_task(conversation_id: str, request: Request) -> dict:
     """The durable objective and plan, so the UI can show what the agent is doing."""
-    if _service(request).get(conversation_id) is None:
+    if _service(request).meta(conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     runtime = request.app.state.runtime
     task = runtime.tasks.active(conversation_id)
@@ -322,7 +483,7 @@ def get_task(conversation_id: str, request: Request) -> dict:
 @router.get("/{conversation_id}/runs")
 def list_runs(conversation_id: str, request: Request) -> dict:
     """Execution attempts, most recent first, with their recorded outcomes."""
-    if _service(request).get(conversation_id) is None:
+    if _service(request).meta(conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     from backend.repositories import RunRepository
 
@@ -372,7 +533,7 @@ def reconcile_attempt(
     Deliberately human-driven. The runtime cannot know whether a side effect landed,
     and letting the model adjudicate its own uncertain effect would defeat the point.
     """
-    if _service(request).get(conversation_id) is None:
+    if _service(request).meta(conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     ledger = request.app.state.runtime.ledger
     known = {item["id"] for item in ledger.describe_conversation(conversation_id)["uncertain"]}
@@ -393,7 +554,7 @@ def reconcile_attempt(
 async def upload_files(
     conversation_id: str, request: Request, files: list[UploadFile] = File(...)
 ) -> dict:
-    if _service(request).get(conversation_id) is None:
+    if _service(request).meta(conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     workspace = _workspace(request, conversation_id)
     saved = []
@@ -420,7 +581,7 @@ async def upload_files(
 
 @router.get("/{conversation_id}/workspace")
 def list_workspace(conversation_id: str, request: Request) -> dict:
-    if _service(request).get(conversation_id) is None:
+    if _service(request).meta(conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     workspace = _workspace(request, conversation_id)
     # Keep the 500 newest without materialising every path or sorting the whole tree.
@@ -451,7 +612,7 @@ def list_workspace(conversation_id: str, request: Request) -> dict:
 
 @router.get("/{conversation_id}/workspace/download")
 def download_workspace_file(conversation_id: str, path: str, request: Request) -> FileResponse:
-    if _service(request).get(conversation_id) is None:
+    if _service(request).meta(conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     workspace = _workspace(request, conversation_id)
     try:
@@ -466,7 +627,7 @@ def download_workspace_file(conversation_id: str, path: str, request: Request) -
 @router.get("/{conversation_id}/workspace/download-all")
 def download_workspace_archive(conversation_id: str, request: Request) -> StreamingResponse:
     """Zip the whole workspace, applying the same rules as the file listing."""
-    if _service(request).get(conversation_id) is None:
+    if _service(request).meta(conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     workspace = _workspace(request, conversation_id)
 

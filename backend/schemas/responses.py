@@ -46,6 +46,8 @@ class MessageOut(BaseModel):
 
 class ConversationDetail(ConversationSummary):
     messages: list[MessageOut]
+    has_more: bool = False
+    next_before: str | None = None
 
 
 class ToolOut(BaseModel):

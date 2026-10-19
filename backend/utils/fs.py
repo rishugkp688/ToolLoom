@@ -17,7 +17,7 @@ def atomic_write_text(path: Path | str, text: str, *, encoding: str = "utf-8") -
         prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
     )
     try:
-        with os.fdopen(fd, "w", encoding=encoding) as handle:
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as handle:
             handle.write(text)
             handle.flush()
             if previous_mode is not None:

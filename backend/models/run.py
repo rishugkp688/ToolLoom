@@ -1,9 +1,8 @@
 """One execution attempt toward a task.
 
-The runtime is request-owned, so a run is not a background job: this row is the
-durable *record* of an attempt, created when the attempt starts and closed whatever
-way it ends. It is what makes "what happened last time?" answerable after a crash,
-a timeout or a closed tab, and what a resume reads instead of guessing.
+This row records an attempt whether it is owned by a request or by the optional
+in-process supervisor. It closes however execution ends. Supervised event replay
+uses RunEvent; restart recovery marks live work interrupted and never replays it.
 """
 
 from __future__ import annotations

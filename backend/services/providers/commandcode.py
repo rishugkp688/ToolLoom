@@ -134,20 +134,40 @@ class CommandCodeProvider(BaseProvider):
     # -- style / auth ---------------------------------------------------------
 
     def _resolve_style(self, model: str) -> str:
-        style = (self.settings.commandcode_api_style or "openai").lower()
-        if style in {"openai", "anthropic"}:
-            return style
         lowered = (model or "").lower()
         if "claude" in lowered or "anthropic" in lowered:
             return "anthropic"
+        style = (self.settings.commandcode_api_style or "auto").lower()
+        if style in {"openai", "anthropic"}:
+            return style
         return "openai"
+
+    def _http_error(self, status: int, detail: str) -> ProviderError:
+        public_status, category = 502, "provider"
+        if status in {400, 404, 422}:
+            public_status, category = 422, "provider_validation"
+        elif status == 413:
+            public_status, category = 413, "context_budget"
+        elif status in {401, 403}:
+            category = "provider_authentication"
+        elif status == 429:
+            public_status, category = 429, "provider_rate_limit"
+        elif status == 503:
+            public_status, category = 503, "provider_unavailable"
+        elif status == 504:
+            public_status, category = 504, "provider_timeout"
+        return ProviderError(
+            f"provider returned HTTP {status}: {self._redact(detail)[:500]}",
+            status=public_status, category=category,
+        )
 
     def _require_key(self) -> str:
         key = self.settings.commandcode_api_key
         if not key:
             raise ProviderError(
                 "COMMANDCODE_API_KEY is not set. Add it to your local .env to use "
-                "LLM_PROVIDER=commandcode (or set LLM_PROVIDER=fake for offline mode)."
+                "LLM_PROVIDER=commandcode (or set LLM_PROVIDER=fake for offline mode).",
+                status=503, category="provider_configuration",
             )
         return key
 
@@ -202,9 +222,7 @@ class CommandCodeProvider(BaseProvider):
                     if response.status_code >= 400:
                         body = await response.aread()
                         detail = self._redact(body.decode("utf-8", "replace"))
-                        error = ProviderError(
-                            f"provider returned HTTP {response.status_code}: {detail[:500]}"
-                        )
+                        error = self._http_error(response.status_code, detail)
                         retryable = (
                             response.status_code in _RETRYABLE_STATUS
                             and attempts < 2
@@ -224,7 +242,21 @@ class CommandCodeProvider(BaseProvider):
                 if attempts < 2 and not started:
                     await asyncio.sleep(0.5)
                     continue
-                raise ProviderError(self._redact(f"provider connection failed: {exc}")) from exc
+                raise ProviderError(
+                    "Provider connection failed. Check the gateway and retry.",
+                    status=503, category="provider_unavailable",
+                ) from exc
+            except httpx.TimeoutException as exc:
+                raise ProviderError(
+                    "Provider request timed out. Partial responses are not retried automatically.",
+                    status=504, category="provider_timeout",
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise ProviderError(
+                    "Provider connection interrupted. "
+                    "Partial responses are not retried automatically.",
+                    status=502, category="provider_transport",
+                ) from exc
             finally:
                 if owns_client:
                     await client.aclose()
@@ -237,13 +269,16 @@ class CommandCodeProvider(BaseProvider):
         try:
             response = await client.get(url, headers=headers)
             if response.status_code >= 400:
-                raise ProviderError(
-                    f"provider returned HTTP {response.status_code}: "
-                    f"{self._redact(response.text)[:500]}"
-                )
+                raise self._http_error(response.status_code, response.text)
             return response.json()
+        except httpx.TimeoutException as exc:
+            raise ProviderError(
+                "Model catalogue request timed out.", status=504, category="provider_timeout",
+            ) from exc
         except httpx.HTTPError as exc:
-            raise ProviderError(self._redact(f"provider request failed: {exc}")) from exc
+            raise ProviderError(
+                "Model catalogue connection failed.", status=502, category="provider_transport",
+            ) from exc
         finally:
             if owns_client:
                 await client.aclose()

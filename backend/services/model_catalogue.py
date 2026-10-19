@@ -6,7 +6,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 
-from backend.services.providers.base import ModelInfo
+from backend.services.providers.base import ModelInfo, ProviderError
 
 FALLBACK_CONTEXT_WINDOW = 32_768  # a local budget, never advertised as model metadata
 # Ceiling for the derived output allowance. Half the window leaves the other half for
@@ -67,6 +67,7 @@ class ModelCatalogue:
         self._expires = 0
         self._lock = asyncio.Lock()
         self._error_until = 0
+        self._failure = None
 
     async def list(self) -> list[ModelInfo]:
         async with self._lock:
@@ -74,13 +75,23 @@ class ModelCatalogue:
             if self._models is not None and now < self._expires:
                 return self._models
             if now < self._error_until:
-                raise RuntimeError("model catalogue temporarily unavailable")
+                message, status, category = self._failure
+                raise ProviderError(message, status=status, category=category)
             try:
                 async with asyncio.timeout(8):
                     models = await self.provider.list_models()
-            except Exception:
+            except Exception as exc:
                 self._error_until = time.monotonic() + 30
-                raise
+                if isinstance(exc, ProviderError):
+                    self._failure = (str(exc), exc.status, exc.category)
+                    raise
+                status = 504 if isinstance(exc, TimeoutError) else 503
+                self._failure = (
+                    "Model catalogue temporarily unavailable.", status, "provider_unavailable"
+                )
+                raise ProviderError(
+                    self._failure[0], status=status, category=self._failure[2]
+                ) from exc
             self._models = models
             self._expires = time.monotonic() + 300
             return models

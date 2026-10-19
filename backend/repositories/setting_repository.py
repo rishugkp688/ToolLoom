@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
 from backend.models import Setting
@@ -14,16 +15,18 @@ class SettingRepository:
     def get(self) -> Setting:
         setting = self.session.get(Setting, GLOBAL_SETTING_ID)
         if setting is None:
-            setting = Setting(id=GLOBAL_SETTING_ID, system_prompt="")
-            self.session.add(setting)
-            self.session.flush()
+            # Another connection may have read the same empty database. Do not
+            # rollback the caller's transaction to recover a singleton collision.
+            self.session.execute(
+                insert(Setting).values(id=GLOBAL_SETTING_ID, system_prompt="")
+                .on_conflict_do_nothing(index_elements=[Setting.id])
+            )
+            setting = self.session.get(Setting, GLOBAL_SETTING_ID)
+            assert setting is not None
         return setting
 
     def get_system_prompt(self) -> str:
-        try:
-            return self.get().system_prompt or ""
-        except Exception:  # fail-open: a bad settings row must not take chat offline
-            return ""
+        return self.get().system_prompt or ""
 
     def set_system_prompt(self, prompt: str) -> Setting:
         setting = self.get()

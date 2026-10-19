@@ -17,6 +17,9 @@ account and no telemetry.
 
 - **Backend-owned agent loop** with streaming responses, stop reasons, usage and
   resumable runs, plus configurable step, tool-call, output and time budgets.
+- **Optional background runs.** Keep a run working after disconnect, attach to its
+  saved event stream, cancel it explicitly, or queue a new direction between model
+  requests. Backend restarts interrupt work; Continue resumes from saved state.
 - **Provider-neutral model contract.** The included adapter targets the
   [Command Code Provider API](https://api.commandcode.ai/provider/v1) using
   OpenAI-compatible or Anthropic-compatible wire styles. A deterministic
@@ -79,7 +82,7 @@ setting is documented there. The most commonly changed values are:
 | `COMMANDCODE_API_KEY` | — | Provider key. Server-side only; never sent to the browser |
 | `COMMANDCODE_BASE_URL` | `https://api.commandcode.ai/provider/v1` | Provider endpoint |
 | `COMMANDCODE_MODEL` | `deepseek/deepseek-v4-flash` | Default model id |
-| `COMMANDCODE_API_STYLE` | `openai` | `openai`, `anthropic`, or `auto` |
+| `COMMANDCODE_API_STYLE` | `auto` | `openai`, `anthropic`, or `auto`; known Claude models always use `/messages` |
 | `MODEL_MAX_OUTPUT_TOKENS` | auto | Per-turn output cap; blank derives it from the context window |
 | `MODEL_CONTEXT_WINDOW` | auto | Optional local ceiling; blank uses provider metadata |
 | `TOOLLOOM_MAX_ITERATIONS` | `100` | Model turns per run |
@@ -122,7 +125,8 @@ The built-in `sandbox` server includes:
 
 | Tool | Purpose |
 | --- | --- |
-| `fs_read`, `fs_write`, `fs_list`, `fs_grep`, `fs_delete` | Workspace files |
+| `fs_read`, `fs_write`, `fs_edit`, `fs_list`, `fs_grep`, `fs_delete` | Workspace files; guarded exact edits |
+| `repo_instructions` | Workspace `AGENTS.md` / `CLAUDE.md` discovery, root to target directory |
 | `plan_read`, `plan_write` | Durable task objective and plan |
 | `http_fetch` | Outbound HTTP(S) with private/loopback hosts refused |
 | `web_search` | Keyless web search (DuckDuckGo, Wikipedia or SearXNG) |
@@ -191,9 +195,73 @@ ToolLoom is designed for a single trusted user on a local machine.
   instructions.
 - At most one run is active per conversation, with 16 concurrent runs globally.
   Competing requests receive `409` or `429`.
+- Supervisors and MCP pools belong to one backend process. Use one worker. Live
+  sessions and in-flight inference do not survive a restart; saved transcripts and
+  event journals do. Linux process supervision reaps descendants that detach with
+  `setsid`; this is process ownership, not OS isolation. Other operating systems
+  retain their existing process-group/tree cleanup limitations.
+- Coding tools support guarded edits and repository instructions. There is no
+  integrated LSP, git checkpoint/undo UI, or agent delegation. Tests and compiler
+  commands can be run through the approved shell tool.
 
 Local-model providers are not included yet. The runtime is provider-neutral, so
 another adapter can be added without changing the agent loop or the UI.
+
+### Long tasks, history and accounting
+
+Select **Keep running when disconnected** before sending a task to use supervised
+mode. **Detach** leaves it running; **Stop** requests cancellation. Reopen the chat
+and select **Attach to running task** to replay its progress. Type a change into the
+composer and select **Send direction** to queue it at the next model request. A tool
+already executing finishes or is explicitly cancelled; steering does not undo it.
+If a run ends first, queued direction remains for Continue. A new ordinary message
+supersedes undelivered direction from an earlier run.
+
+API clients can `POST /conversations/{id}/runs` with a normal message body, or use
+`?resume=true` without a body. The `202` response contains `run_id` and `events_url`.
+Attach with `GET events_url?after=N` or `Last-Event-ID: N`; events have increasing
+integer IDs. `POST /conversations/{id}/runs/{run_id}/cancel` cancels and `/steer`
+accepts `{"message":"new direction"}`. Disconnecting this GET never cancels work.
+`GET /conversations/{id}/runs/active` discovers the live supervised run. The original
+`/messages[/stream]` and `/continue[/stream]` endpoints remain request-owned.
+
+Conversation detail returns the latest 100 messages by default. Use `limit` (1–500)
+and the returned `next_before` cursor to load earlier pages; `has_more` marks older
+history. Tool exchanges stay together, so one exchange can exceed a page's row or
+size target. Reloads render the latest page; **Load earlier messages** expands it.
+`/meta` remains a small metadata response.
+
+Usage totals include provider-reported transcript, title, compaction and interrupted
+request usage when available. Character estimates are used for prompt fitting and
+calibrated by actual reported prompt usage. A request that never reports its usage
+cannot be counted exactly; no tokenizer or unknown model capabilities are invented.
+
+New `fs_edit` and `repo_instructions` tools start disabled. Enable them in Settings
+to opt in. `fs_read(with_metadata=true)` returns the revision digest for `fs_edit`;
+edits require that digest and one unique matching `old_text`. Atomic replacement
+and workspace serialization protect ToolLoom writes; external editors are not
+covered by an OS-wide compare-and-swap guarantee. When instruction discovery is
+enabled, root instructions enter context; the agent can request instructions for
+nested paths. Schema changes can revoke approval on an existing tool: review and
+re-enable `fs_read` after upgrading if its prior approval was reset.
+
+Shell and Python results report the requested/effective timeout and provide
+`output_captures` with read-only workspace paths. Retrieve those paths with
+`fs_read`; the model's head/tail view can omit content that remains in the capture.
+Captures are UTF-8 text redacted before saving, capped at 16 MiB per stream,
+128 MiB and 2,048 files per conversation. Quota/disk errors leave the command
+result intact and explicitly mark capture loss. Paged reads cap output and return
+an `offset`/`column` continuation for long lines. Foreground commands still stop
+their descendants; there is no background shell-job mode. Strict Bash pipelines
+retain `pipefail`, including exit 141 for an early-closed upstream writer.
+
+HTTP fetch pins connections to validated public addresses with the original TLS
+hostname, rejects cross-origin redirects carrying caller headers or mutations,
+honors 303 retrieval redirects, decodes declared charsets and filters response
+headers. Its mutating-method contract is classified as mutating on upgrade too.
+DNS waits are bounded to four outstanding lookups; a timed-out OS lookup retains
+its slot until it returns. Socket phase timeouts can finish after the overall
+budget; late body results are rejected. No TLS verification is disabled.
 
 ## Development
 

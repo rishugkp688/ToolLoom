@@ -45,9 +45,12 @@ def read(workspace: Workspace, arguments: dict) -> str:
     size = target.stat().st_size
     offset = arguments.get("offset")
     limit = arguments.get("limit")
-    paged = offset is not None or limit is not None
+    column = arguments.get("column")
+    paged = offset is not None or limit is not None or column is not None
 
     if paged:
+        if arguments.get("with_metadata"):
+            raise ToolPreflightError("with_metadata requires a full read; omit offset and limit")
         if size > MAX_PAGED_READ:
             raise WorkspaceError(f"file too large to page ({size} bytes)")
         if _is_binary(target):
@@ -55,33 +58,105 @@ def read(workspace: Workspace, arguments: dict) -> str:
         try:
             offset_value = int(offset) if offset is not None else 1
             limit_value = int(limit) if limit is not None else 500
+            column_value = int(column) if column is not None else 1
         except (TypeError, ValueError) as exc:
             raise WorkspaceError("offset and limit must be integers") from exc
         if offset_value < 1:
             raise WorkspaceError("offset must be at least 1")
         if limit_value < 1:
             raise WorkspaceError("limit must be at least 1")
-        start = offset_value - 1
-        count = limit_value
-        lines: list[str] = []
+        if column_value < 1:
+            raise WorkspaceError("column must be at least 1")
+        # readline(size) bounds allocation even for a single 200 MiB line.
+        budget = MAX_RETURN_CHARS - 200  # reserve room for a retrieval footer
+        parts = []
+        used = 0
+        line_number = 1
+        position = 1
+        delivered_lines = 0
+        truncated = False
         with target.open("r", encoding="utf-8", errors="replace") as handle:
-            for index, line in enumerate(handle):
-                if index < start:
-                    continue
-                if len(lines) >= count:
+            while line_number < offset_value:
+                piece = handle.readline(65_536)
+                if not piece:
+                    return "(no lines in range)"
+                if piece.endswith("\n"):
+                    line_number += 1
+            while position < column_value:
+                piece = handle.readline(min(65_536, column_value - position))
+                if not piece or piece.endswith("\n"):
+                    return "(column beyond line; choose a smaller column or next line)"
+                position += len(piece)
+            while delivered_lines < limit_value:
+                piece = handle.readline(min(65_536, budget - used + 1))
+                if not piece:
                     break
-                lines.append(line.rstrip("\n"))
-        return "\n".join(lines) if lines else "(no lines in range)"
+                kept = piece[:budget - used]
+                parts.append(kept)
+                used += len(kept)
+                if kept.endswith("\n"):
+                    line_number += 1
+                    position = 1
+                    delivered_lines += 1
+                else:
+                    position += len(kept)
+                if len(kept) < len(piece):
+                    truncated = True
+                    break
+        body = "".join(parts)
+        if body.endswith("\n"):
+            body = body[:-1]
+        if not parts:
+            body = "(no lines in range)"
+        if truncated:
+            body += (f"\n…[truncated; continue with offset={line_number}, "
+                     f"column={position}, limit={limit_value - delivered_lines}]")
+        return body
 
     if size > MAX_UNPAGED_READ:
         raise WorkspaceError(f"file is {size} bytes; re-read with `offset`/`limit` (line paging)")
     if _is_binary(target):
         raise WorkspaceError("refusing to read a binary file")
 
-    text = target.read_text(encoding="utf-8", errors="replace")
+    data = target.read_bytes()
+    text = data.decode("utf-8", errors="replace")
+    truncated = len(text) > MAX_RETURN_CHARS
     if len(text) > MAX_RETURN_CHARS:
         text = text[:MAX_RETURN_CHARS] + f"\n…[truncated at {MAX_RETURN_CHARS} chars]"
+    if arguments.get("with_metadata"):
+        return json.dumps({"path": workspace.relative(target),
+                           "sha256": hashlib.sha256(data).hexdigest(),
+                           "truncated": truncated, "content": text})
     return text
+
+
+def edit(workspace: Workspace, arguments: dict) -> str:
+    """One exact replacement with mandatory revision and uniqueness checks."""
+    try:
+        target = workspace.resolve(arguments.get("path"), must_exist=True)
+        if target.is_dir() or target.stat().st_size > MAX_WRITE_BYTES:
+            raise WorkspaceError("edit requires a text file no larger than 10 MiB")
+        data = target.read_bytes()
+        text = data.decode("utf-8")
+        expected = arguments.get("expected_sha256")
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+            raise WorkspaceError("edit requires expected_sha256 from fs_read(with_metadata=true)")
+        if hashlib.sha256(data).hexdigest().lower() != expected.lower():
+            raise WorkspaceError("file changed since it was read; re-read it before editing")
+        old, new = arguments.get("old_text"), arguments.get("new_text")
+        if not isinstance(old, str) or not old or not isinstance(new, str):
+            raise WorkspaceError("old_text must be nonempty and new_text must be text")
+        if text.count(old) != 1:
+            raise WorkspaceError(
+                "old_text must match exactly once; include more surrounding context"
+            )
+        content = text.replace(old, new, 1)
+        # Validate every path/size/runtime-file condition before the first effect.
+        prepared = {"path": arguments["path"], "content": content, "expected_sha256": expected}
+        _prepare_write(workspace, prepared)
+    except (WorkspaceError, OSError, ValueError, TypeError) as exc:
+        raise ToolPreflightError(str(exc)) from exc
+    return write(workspace, prepared)
 
 
 def _is_runtime_owned(workspace: Workspace, target: Path) -> bool:
@@ -89,7 +164,7 @@ def _is_runtime_owned(workspace: Workspace, target: Path) -> bool:
         relative = target.resolve().relative_to(workspace.root)
     except ValueError:
         return False
-    return RUNTIME_DIR in relative.parts
+    return any(part in {RUNTIME_DIR, ".transcripts"} for part in relative.parts)
 
 
 def _prepare_write(workspace: Workspace, arguments: dict):

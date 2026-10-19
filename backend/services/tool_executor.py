@@ -313,6 +313,11 @@ class ToolExecutor:
         return redact(arguments)
 
     def _build_context(self, conversation_id: str) -> ToolContext:
+        output_secrets = []
+        if self.secret_resolver is not None and hasattr(self.secret_resolver, "redaction_values"):
+            output_secrets.extend(self.secret_resolver.redaction_values())
+        if self.settings.commandcode_api_key:
+            output_secrets.append(self.settings.commandcode_api_key)
         skills: list[dict] = []
         try:
             with self.db.session() as session:
@@ -337,6 +342,7 @@ class ToolExecutor:
             settings=self.settings,
             registry=self.registry,
             tasks=TaskService(self.db, self.settings),
+            output_secrets=tuple(output_secrets),
         )
 
     def _spill(self, conversation_id: str, result: ExecutionResult) -> None:
@@ -359,7 +365,7 @@ class ToolExecutor:
             return
         reference = f".transcripts/{safe_id}.txt"
         result.model_text = (
-            f"[TRUNCATED — full output ({len(result.output_text)} chars) at "
+            f"[TRUNCATED — received tool result ({len(result.output_text)} chars) at "
             f"`{reference}`; use fs_read with offset/limit or fs_grep to retrieve "
             "any part.]\n\n" + result.model_text
         )

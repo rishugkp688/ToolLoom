@@ -54,6 +54,11 @@ class Database:
 
         Base.metadata.create_all(self.engine)
         self._apply_lightweight_migrations()
+        # create_all does not add indexes to an existing table.
+        from backend.models import Message
+
+        for index in Message.__table__.indexes:
+            index.create(self.engine, checkfirst=True)
 
     def _apply_lightweight_migrations(self) -> None:
         """Add columns introduced after a database was first created.
@@ -65,6 +70,7 @@ class Database:
         from sqlalchemy import inspect, text
 
         additions: dict[str, dict[str, str]] = {
+            "run_inputs": {"superseded_at": "DATETIME"},
             "tool_attempts": {
                 "arguments_json": "TEXT NOT NULL DEFAULT '{}'",
                 "reconciliation_note": "TEXT",
@@ -72,6 +78,10 @@ class Database:
             },
             "settings": {"unlimited_tools": "BOOLEAN NOT NULL DEFAULT 0"},
             "conversations": {
+                "compaction_usage_input": "INTEGER NOT NULL DEFAULT 0",
+                "compaction_usage_output": "INTEGER NOT NULL DEFAULT 0",
+                "interrupted_usage_input": "INTEGER NOT NULL DEFAULT 0",
+                "interrupted_usage_output": "INTEGER NOT NULL DEFAULT 0",
                 "title_source": "VARCHAR(16) DEFAULT 'legacy'",
                 "title_usage_input": "INTEGER DEFAULT 0",
                 "title_usage_output": "INTEGER DEFAULT 0",

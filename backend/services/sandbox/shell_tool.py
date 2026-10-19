@@ -80,6 +80,8 @@ async def execute(arguments, context, settings) -> ToolCallOutcome:
         env=env,
         timeout=timeout,
         max_bytes=settings.toolloom_shell_output_bytes,
+        capture_dir=Path(context.workspace().root),
+        secrets=getattr(context, "output_secrets", ()),
     )
     timed_out = result.stop_reason == "timeout"
     payload = {
@@ -90,7 +92,24 @@ async def execute(arguments, context, settings) -> ToolCallOutcome:
         "exit_code": result.exit_code,
         "stop_reason": result.stop_reason,
         "truncated": result.truncated,
+        "requested_timeout_seconds": arguments.get("timeout_seconds"),
+        "effective_timeout_seconds": timeout,
+        "shell": Path(shell[0]).name,
+        "pipefail": "pipefail" in shell,
+        "lingering_children": result.lingering_children,
+        "cleanup_error": result.cleanup_error,
+        "output_captures": result.captures,
     }
+    if result.lingering_children:
+        payload["descendant_note"] = (
+            "foreground command exited; owned descendants were stopped"
+            if result.cleanup_error is None
+            else "foreground command exited; descendant cleanup is incomplete"
+        )
+    if result.exit_code == 141:
+        payload["pipeline_note"] = (
+            "SIGPIPE: an upstream writer may have been closed early; verify pipeline intent"
+        )
     if timed_out:
         payload["note"] = f"stopped after {timeout}s; output above is partial"
     # A failing test run, or `grep` finding nothing, exits non-zero and is still the
@@ -99,7 +118,7 @@ async def execute(arguments, context, settings) -> ToolCallOutcome:
     return ToolCallOutcome(
         text=json.dumps(payload),
         is_error=timed_out,
-        outcome_uncertain=timed_out,
+        outcome_uncertain=timed_out or result.cleanup_error is not None,
         exit_code=result.exit_code,
         verification_failed=(not timed_out and result.exit_code not in (None, 0)),
     )

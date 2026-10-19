@@ -8,6 +8,8 @@ const state = {
   sessions: [],
   currentId: null,
   messages: [],
+  historyBefore: null,
+  historyLoading: false,
   models: [],
   modelId: localStorage.getItem("toolloom.model") || "",
   running: false,
@@ -16,6 +18,9 @@ const state = {
   promptLoadVersion: 0,
   runFinished: null,
   controller: null,
+  currentRunId: null,
+  managedStart: null,
+  attachableRunId: null,
   filter: "",
   attachments: [],
   canContinue: false,
@@ -204,6 +209,9 @@ async function openSession(id) {
   closeDrawers();
   state.currentId = id;
   state.messages = [];
+  state.historyBefore = null;
+  state.attachableRunId = null;
+  $("attachRunBtn").hidden = true;
   state.attachments = [];
   setContinue(false);
   renderChips();
@@ -212,9 +220,11 @@ async function openSession(id) {
     const detail = await api(`/conversations/${id}`);
     if (state.currentId !== id) return;
     state.messages = detail.messages;
+    state.historyBefore = detail.next_before;
     restoreStopState(detail.messages);
     $("sessionTitle").textContent = detail.title || "Untitled session";
     renderLog();
+    await refreshActiveRun(id);
     await refreshInspector();
   } catch (err) {
     toast(err.message, "error");
@@ -499,6 +509,16 @@ function activityElement() {
 function renderLog() {
   const host = $("turns");
   host.innerHTML = "";
+  if (state.historyBefore) {
+    const row = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Load earlier messages";
+    button.disabled = state.historyLoading;
+    button.addEventListener("click", loadEarlierMessages);
+    row.appendChild(button);
+    host.appendChild(row);
+  }
   $("logEmpty").hidden = state.messages.length > 0;
   $("starters").hidden = state.messages.length > 0;
   const results = resultsById(state.messages);
@@ -546,6 +566,27 @@ function renderLog() {
   scrollLog();
 }
 
+async function loadEarlierMessages() {
+  if (!state.historyBefore || state.historyLoading || state.running) return;
+  const id = state.currentId;
+  const cursor = state.historyBefore;
+  state.historyLoading = true;
+  const log = $("log");
+  const height = log.scrollHeight;
+  const top = log.scrollTop;
+  try {
+    const detail = await api(`/conversations/${id}?before=${encodeURIComponent(cursor)}`);
+    if (state.currentId !== id || state.historyBefore !== cursor || state.running) return;
+    const existing = new Set(state.messages.map(message => message.id));
+    state.messages = [...detail.messages.filter(message => !existing.has(message.id)), ...state.messages];
+    state.historyBefore = detail.next_before;
+    state.historyLoading = false;
+    renderLog();
+    log.scrollTop = top + log.scrollHeight - height;
+  } catch (err) { toast(err.message, "error"); }
+  finally { state.historyLoading = false; }
+}
+
 function scrollLog() {
   const log = $("log");
   log.scrollTop = log.scrollHeight;
@@ -569,13 +610,19 @@ function parseSSE(buffer, onEvent) {
   return buffer;
 }
 
-async function streamRun(url, payload, { userText = null, attachments = [] } = {}) {
+async function streamRun(url, payload, { userText = null, attachments = [], attachRunId = null } = {}) {
   let finishRun;
   state.runFinished = new Promise(resolve => { finishRun = resolve; });
   const runSessionId = state.currentId;
   const controller = new AbortController();
   state.controller = controller;
   state.running = true;
+  state.currentRunId = attachRunId;
+  const supervised = Boolean(attachRunId || $("keepRunning").checked);
+  $("keepRunning").disabled = true;
+  $("attachRunBtn").hidden = true;
+  $("detachRunBtn").hidden = !attachRunId;
+  $("steerRunBtn").hidden = !attachRunId;
   startTitleWatch(runSessionId);
   $("sendBtn").disabled = true;
   $("unlimitedTools").disabled = true;
@@ -601,6 +648,12 @@ async function streamRun(url, payload, { userText = null, attachments = [] } = {
     <div class="turn-body"></div>`;
   $("turns").appendChild(live);
   const body = live.querySelector(".turn-body");
+  if (attachRunId) {
+    const notice = document.createElement("p");
+    notice.className = "hint";
+    notice.textContent = "Replaying this run from its start. The saved transcript is shown above.";
+    body.appendChild(notice);
+  }
   scrollLog();
 
   let text = "";
@@ -697,12 +750,29 @@ async function streamRun(url, payload, { userText = null, attachments = [] } = {
   };
 
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
+    let res;
+    if (supervised) {
+      let eventsUrl = `/conversations/${runSessionId}/runs/${attachRunId}/events`;
+      if (!attachRunId) {
+        const resume = url.includes("/continue/");
+        const query = resume ? `?resume=true&model_id=${encodeURIComponent(state.modelId || "")}` : "";
+        state.managedStart = api(`/conversations/${runSessionId}/runs${query}`, {
+          method: "POST", ...(resume ? {} : {body: JSON.stringify(payload)}), signal: controller.signal,
+        });
+        const startedRun = await state.managedStart;
+        state.managedStart = null;
+        state.currentRunId = startedRun.run_id;
+        eventsUrl = startedRun.events_url;
+      }
+      $("detachRunBtn").hidden = false;
+      $("steerRunBtn").hidden = false;
+      res = await fetch(eventsUrl, {signal: controller.signal});
+    } else {
+      res = await fetch(url, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload), signal: controller.signal,
+      });
+    }
     if (!res.ok || !res.body) {
       const detail = await res.json().catch(() => ({}));
       throw new Error(detail.detail || `Run failed (${res.status})`);
@@ -724,7 +794,7 @@ async function streamRun(url, payload, { userText = null, attachments = [] } = {
     if (err.name === "AbortError") {
       setContinue(true);
       setState("idle");
-      announce("Run stopped.");
+      announce(supervised ? "Disconnected from the run. Attach again to see progress." : "Run stopped.");
     } else {
       streamFailed = true;
       setContinue(true);
@@ -734,6 +804,11 @@ async function streamRun(url, payload, { userText = null, attachments = [] } = {
   } finally {
     state.running = false;
     state.controller = null;
+    state.currentRunId = null;
+    state.managedStart = null;
+    $("keepRunning").disabled = false;
+    $("detachRunBtn").hidden = true;
+    $("steerRunBtn").hidden = true;
     $("sendBtn").disabled = false;
     $("unlimitedTools").disabled = false;
     $("stopBtn").hidden = true;
@@ -802,13 +877,53 @@ async function refreshSession(id) {
       const detail = await api(`/conversations/${id}`);
       if (state.currentId === id) {
         state.messages = detail.messages;
+        state.historyBefore = detail.next_before;
         restoreStopState(detail.messages);
         $("sessionTitle").textContent = detail.title || "Untitled session";
         renderLog();
+        await refreshActiveRun(id);
       }
     } catch (_) {}
   }
   await Promise.all([loadSessions(), refreshInspector(), loadUsage()]);
+}
+
+async function refreshActiveRun(id) {
+  try {
+    const result = await api(`/conversations/${id}/runs/active`);
+    if (state.currentId !== id) return;
+    state.attachableRunId = result.run_id;
+    $("attachRunBtn").hidden = !result.run_id || state.running;
+  } catch (_) { /* A failed status read must not hide the saved transcript. */ }
+}
+
+async function stopCurrentRun() {
+  const controller = state.controller;
+  if (!controller) return;
+  const conversationId = state.currentId;
+  let runId = state.currentRunId;
+  // Stop during startup must first learn the run ID; aborting the POST alone
+  // would detach from a run the operator explicitly asked to cancel.
+  if (!runId && state.managedStart) {
+    runId = (await state.managedStart).run_id;
+  }
+  if (runId) {
+    try {
+      await api(`/conversations/${conversationId}/runs/${runId}/cancel`, {method: "POST"});
+    } catch (err) { toast(err.message, "error"); return; }
+  }
+  controller.abort();
+}
+
+async function steerCurrentRun() {
+  const input = $("promptInput");
+  const message = input.value.trim();
+  if (!message || !state.currentRunId) return;
+  await api(`/conversations/${state.currentId}/runs/${state.currentRunId}/steer`, {
+    method: "POST", body: JSON.stringify({message}),
+  });
+  if (input.value.trim() === message) input.value = "";
+  toast("Direction queued for the next model request.");
 }
 
 const RESUMABLE_STOPS = new Set([
@@ -1941,7 +2056,16 @@ function wire() {
     event.preventDefault();
     submitMessage().catch((err) => toast(err.message, "error"));
   });
-  $("stopBtn").addEventListener("click", () => state.controller && state.controller.abort());
+  $("stopBtn").addEventListener("click", () => stopCurrentRun().catch(err => toast(err.message, "error")));
+  $("detachRunBtn").addEventListener("click", () => state.controller?.abort());
+  $("attachRunBtn").addEventListener("click", () => {
+    if (!state.running && state.attachableRunId) {
+      streamRun("", {}, {attachRunId: state.attachableRunId}).catch(err => toast(err.message, "error"));
+    }
+  });
+  $("steerRunBtn").addEventListener("click", () => steerCurrentRun().catch(err => toast(err.message, "error")));
+  $("keepRunning").checked = localStorage.getItem("toolloom.keepRunning") === "true";
+  $("keepRunning").addEventListener("change", event => localStorage.setItem("toolloom.keepRunning", String(event.target.checked)));
   $("continueBtn").addEventListener("click", () => continueRun().catch(err => toast(err.message, "error")));
   $("continueBtnBench").addEventListener("click", () => continueRun().catch(err => toast(err.message, "error")));
   $("attachBtn").addEventListener("click", () => $("fileInput").click());

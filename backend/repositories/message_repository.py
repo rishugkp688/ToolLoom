@@ -72,6 +72,55 @@ class MessageRepository:
         )
         return list(self.session.execute(stmt).scalars().all())
 
+    def page(self, conversation_id: str, *, limit: int = 100, before: str | None = None):
+        """Keyset page in chronological order; never separate calls from results.
+
+        Limits apply to complete exchanges. One oversized exchange can exceed
+        them so the audit view stays truthful; ordinary pages target 1 MiB.
+        """
+        base = select(Message).where(Message.conversation_id == conversation_id)
+        if before is not None:
+            boundary = self.session.get(Message, before)
+            if boundary is None or boundary.conversation_id != conversation_id:
+                raise ValueError("invalid message cursor for this conversation")
+            base = base.where(
+                tuple_(Message.created_at, Message.id) < tuple_(boundary.created_at, boundary.id)
+            )
+        newest = base.order_by(Message.created_at.desc(), Message.id.desc())
+        rows = list(self.session.scalars(newest.limit(limit + 1)))
+        more = len(rows) > limit
+        rows = rows[:limit]
+        # Extend backwards to include the call for a leading group of results.
+        while rows and rows[-1].role == "tool":
+            row = self.session.scalars(newest.offset(len(rows)).limit(1)).first()
+            if row is None:
+                more = False
+                break
+            rows.append(row)
+            more = True
+        # Bound normal payloads without throwing away half an exchange.
+        size = 0
+        boundary_index = None
+        for index, row in enumerate(rows):
+            size += len(row.content or "") + len(row.content_blocks_json or "")
+            if row.role != "tool":
+                if size > 1_000_000:
+                    boundary_index = index + 1
+                    break
+        if boundary_index is not None and boundary_index < len(rows):
+            rows = rows[:boundary_index]
+            more = True
+        if rows:
+            oldest = rows[-1]
+            more = self.session.execute(
+                select(Message.id).where(
+                    Message.conversation_id == conversation_id,
+                    tuple_(Message.created_at, Message.id) < tuple_(oldest.created_at, oldest.id),
+                ).limit(1)
+            ).first() is not None
+        rows.reverse()
+        return rows, more
+
     def list_tail(
         self, conversation_id: str, *, offset: int = 0, max_chars: int = 60_000
     ) -> list[Message]:

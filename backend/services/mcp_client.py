@@ -1,8 +1,8 @@
 """Thin async wrapper over the official MCP SDK transports.
 
-We own: per-call sessions, header plumbing, per-server TLS policy, timeouts, and
-error normalization. The SDK owns: JSON-RPC framing, the handshake, and SSE
-parsing.
+We own session opening, header plumbing, per-server TLS policy, deadlines and
+error normalization. The connection manager supervises persistent sessions; the
+standalone helpers retain a per-call contract. The SDK owns JSON-RPC and handshakes.
 """
 
 from __future__ import annotations

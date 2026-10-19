@@ -120,7 +120,8 @@ class DbResolver:
     def resolve_string(self, text: str) -> str:
         return _substitute(text, self.lookup)
 
-    def redact(self, text: str) -> str:
+    def redaction_values(self) -> tuple[str, ...]:
+        """Backend-only snapshot for streaming redaction; never a tool argument."""
         from backend.repositories import SecretRepository
 
         with self.db.session() as session:
@@ -130,7 +131,10 @@ class DbResolver:
                     values.append(self.vault.decrypt(secret.encrypted_value))
                 except SecretsError:
                     continue
-        for value in sorted(values, key=len, reverse=True):
+        return tuple(values)
+
+    def redact(self, text: str) -> str:
+        for value in sorted(self.redaction_values(), key=len, reverse=True):
             if value:
                 text = text.replace(value, "[REDACTED]")
         return text

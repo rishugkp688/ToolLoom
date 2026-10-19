@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 
+from sqlalchemy import update
+
+from backend.models import Conversation
 from backend.repositories import ConversationRepository, MessageRepository
 from backend.services.context_builder import estimate_tokens
 from backend.services.model_catalogue import ModelBudget, budget_for
@@ -49,7 +52,9 @@ class ContextCompactor:
             return False
         previous, head_text, summary_count, head_count = prepared
 
-        summary = await self._summarize(previous, head_text, model_id, budget)
+        summary = await self._summarize(
+            previous, head_text, model_id, budget, conversation_id=conversation_id
+        )
         if not summary:
             return False
 
@@ -100,11 +105,22 @@ class ContextCompactor:
             session.flush()
         return True
 
-    async def _summarize(self, previous: str, head_text: str, model_id, budget: ModelBudget) -> str:
+    def _record_usage(self, conversation_id, usage):
+        with self.db.session() as session:
+            session.execute(update(Conversation).where(Conversation.id == conversation_id).values(
+                compaction_usage_input=Conversation.compaction_usage_input + usage.input_tokens,
+                compaction_usage_output=Conversation.compaction_usage_output + usage.output_tokens,
+            ))
+
+    async def _summarize(
+        self, previous: str, head_text: str, model_id, budget: ModelBudget,
+        *, conversation_id: str | None = None,
+    ) -> str:
         from backend.services.providers.base import (
             BaseProvider,
             ProviderMessage,
             TextBlock,
+            Usage,
         )
 
         provider: BaseProvider = self.provider
@@ -112,17 +128,35 @@ class ContextCompactor:
         if len(prompt) > _summary_input_chars(budget):
             return ""
         output_limit = min(MAX_SUMMARY_TOKENS, budget.max_output_tokens)
+        usage = Usage()
+        turn = None
         try:
-            turn = await provider.complete(
+            options = dict(
                 messages=[ProviderMessage("user", [TextBlock(prompt)])],
                 system=SUMMARY_PROMPT,
                 model_id=model_id or getattr(provider, "model_id", None),
                 max_tokens=output_limit,
             )
+            def observe(reported):
+                nonlocal usage
+                usage = reported
+
+            # Respect provider complete() overrides; the default implementation
+            # additionally exposes usage even when the stream later breaks.
+            if getattr(type(provider), "complete", None) is BaseProvider.complete:
+                options["usage_observer"] = observe
+            turn = await provider.complete(**options)
+            if turn is not None:
+                usage = turn.usage
         except Exception:
             return ""
+        finally:
+            if conversation_id is not None and usage.total_tokens:
+                await run_blocking(self._record_usage, conversation_id, usage)
         if not turn:
             return ""
+        # Rejected/truncated summaries still consumed provider tokens. Keep helper
+        # usage out of transcript rows so summary cursors retain their meaning.
         # A truncated or failed summary must never advance the cursor, because the
         # messages it covers then leave the model's context for good. Only a
         # completed turn is safe to treat as the record of what they said.

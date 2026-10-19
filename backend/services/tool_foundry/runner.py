@@ -59,6 +59,13 @@ def build_argv(package: InstalledPackage, arguments: dict[str, Any]) -> list[str
 
 
 def _failure(package: InstalledPackage, result) -> ToolCallOutcome:
+    if result.cleanup_error is not None:
+        return ToolCallOutcome(
+            text=f"{package.manifest.name}: exit {result.exit_code}; process cleanup incomplete",
+            is_error=True,
+            outcome_uncertain=True,
+            exit_code=result.exit_code,
+        )
     if result.stop_reason == "timeout":
         return ToolCallOutcome(
             text=f"{package.manifest.name} timed out and was terminated",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.db import Base
@@ -11,6 +11,9 @@ from backend.utils import new_id, utcnow
 
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (
+        Index("ix_messages_conversation_order", "conversation_id", "created_at", "id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     conversation_id: Mapped[str] = mapped_column(
