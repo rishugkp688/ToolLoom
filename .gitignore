@@ -42,6 +42,7 @@ htmlcov/
 /IMPLEMENTATION_PLAN.md
 /START_HERE.txt
 /.commandcode/
+/review_artifacts/
 
 # Editor / OS
 .DS_Store

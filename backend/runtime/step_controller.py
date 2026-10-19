@@ -110,9 +110,11 @@ class StepController:
             return note
         return None
 
-    def should_refuse(self, name: str, arguments: dict | None = None) -> bool:
+    def should_refuse(
+        self, name: str, arguments: dict | None = None, *, progress_unknown: bool = False
+    ) -> bool:
         key = (name, _signature(arguments or {}))
-        repeated = self._calls.count(key) >= DUP_REFUSE_THRESHOLD
+        repeated = not progress_unknown and self._calls.count(key) >= DUP_REFUSE_THRESHOLD
         return repeated or self._error_streak.get(key, 0) >= ERROR_CASCADE_THRESHOLD
 
     def advice(self) -> str | None:

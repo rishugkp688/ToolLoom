@@ -17,7 +17,9 @@ frame (including fragmented tool-call JSON).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -43,7 +45,7 @@ from backend.services.providers.base import (
 )
 
 _ANTHROPIC_VERSION = "2023-06-01"
-_RETRYABLE_STATUS = {502, 503, 504}
+_RETRYABLE_STATUS = {429, 502, 503, 504}
 _OPENAI_FINISH = {
     "stop": "end_turn",
     "tool_calls": "tool_use",
@@ -57,6 +59,40 @@ _ANTHROPIC_STOP = {
     "max_tokens": "max_tokens",
     "stop_sequence": "stop_sequence",
 }
+
+# Both wire contracts restrict function names. Internal MCP identities may be
+# longer and contain punctuation such as a dot, so the adapter translates.
+_WIRE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _alias(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_-]", "_", name)
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{slug[:55]}_{digest}"[:64]
+
+
+class _ToolNames:
+    """A reversible, collision-free map from canonical names to wire names."""
+
+    def __init__(self, canonical_names: list[str]) -> None:
+        self.forward: dict[str, str] = {}
+        self.reverse: dict[str, str] = {}
+        used: set[str] = set()
+        for name in canonical_names:
+            wire = name if _WIRE_NAME.match(name) and name not in used else _alias(name)
+            while wire in used:
+                wire = _alias(f"{name}#{len(used)}")
+            used.add(wire)
+            self.forward[name] = wire
+            self.reverse[wire] = name
+
+    def wire(self, name: str) -> str:
+        if name in self.forward:
+            return self.forward[name]
+        return name if _WIRE_NAME.match(name) else _alias(name)
+
+    def canonical(self, wire: str) -> str:
+        return self.reverse.get(wire, wire)
 
 
 class CommandCodeProvider(BaseProvider):
@@ -131,6 +167,22 @@ class CommandCodeProvider(BaseProvider):
         key = self.settings.commandcode_api_key
         return text.replace(key, "***") if key else text
 
+    def _error_detail(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return self._redact(str(payload))[:500]
+        code = str(payload.get("code") or payload.get("type") or payload.get("status") or "unknown")
+        message = str(payload.get("message") or payload.get("detail") or "")
+        lowered = code.lower()
+        if "rate" in lowered or "quota" in lowered:
+            category = "rate_limit"
+        elif "auth" in lowered or "key" in lowered or "permission" in lowered:
+            category = "authentication"
+        elif "context" in lowered or "length" in lowered:
+            category = "context_length"
+        else:
+            category = "provider"
+        return self._redact(f"{category} error (code={code}): {message}")[:500]
+
     # -- request plumbing -----------------------------------------------------
 
     async def _iter_sse(
@@ -159,7 +211,9 @@ class CommandCodeProvider(BaseProvider):
                             and not started
                         )
                         if retryable:
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(
+                                _retry_delay(response.headers.get("retry-after"))
+                            )
                             continue
                         raise error
                     async for event in _sse_events(response):
@@ -206,10 +260,11 @@ class CommandCodeProvider(BaseProvider):
         temperature: float | None,
         *,
         include_usage: bool,
+        names: _ToolNames | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": model,
-            "messages": _to_openai_messages(messages, system),
+            "messages": _to_openai_messages(messages, system, names),
             "stream": True,
         }
         if tools:
@@ -217,7 +272,7 @@ class CommandCodeProvider(BaseProvider):
                 {
                     "type": "function",
                     "function": {
-                        "name": tool.name,
+                        "name": names.wire(tool.name) if names else tool.name,
                         "description": tool.description,
                         "parameters": tool.input_schema or {"type": "object", "properties": {}},
                     },
@@ -243,12 +298,27 @@ class CommandCodeProvider(BaseProvider):
     ) -> AsyncIterator[object]:
         url = f"{self._base}/chat/completions"
         headers = self._headers("openai")
+        names = _ToolNames([tool.name for tool in tools or []])
         payloads = [
             self._openai_payload(
-                messages, system, tools, model, max_tokens, temperature, include_usage=True
+                messages,
+                system,
+                tools,
+                model,
+                max_tokens,
+                temperature,
+                include_usage=True,
+                names=names,
             ),
             self._openai_payload(
-                messages, system, tools, model, max_tokens, temperature, include_usage=False
+                messages,
+                system,
+                tools,
+                model,
+                max_tokens,
+                temperature,
+                include_usage=False,
+                names=names,
             ),
         ]
 
@@ -262,10 +332,12 @@ class CommandCodeProvider(BaseProvider):
             model_used = model
             yielded = False
             try:
-                async for _event_name, data in self._iter_sse(url, headers, payload):
+                async for event_name, data in self._iter_sse(url, headers, payload):
                     if data == "[DONE]":
                         break
                     chunk = self._parse_frame(data)
+                    if event_name == "error" or chunk.get("error"):
+                        raise ProviderError(self._error_detail(chunk.get("error") or chunk))
                     model_used = chunk.get("model") or model_used
                     if isinstance(chunk.get("usage"), dict):
                         usage = _usage_from_openai(chunk["usage"])
@@ -289,7 +361,11 @@ class CommandCodeProvider(BaseProvider):
                             acc["name"] += function["name"]
                         if index not in started_indexes and acc["id"] and acc["name"]:
                             started_indexes.add(index)
-                            yield ToolCallStartEvent(index=index, id=acc["id"], name=acc["name"])
+                            yield ToolCallStartEvent(
+                                index=index,
+                                id=acc["id"],
+                                name=names.canonical(acc["name"]),
+                            )
                         if function.get("arguments"):
                             acc["arguments"] += function["arguments"]
                             yielded = True
@@ -299,7 +375,7 @@ class CommandCodeProvider(BaseProvider):
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
                 turn = self._build_openai_turn(
-                    text_parts, tool_acc, finish_reason, usage, model_used
+                    text_parts, tool_acc, finish_reason, usage, model_used, names
                 )
                 if turn.usage.total_tokens or turn.usage.input_tokens:
                     yield UsageEvent(turn.usage)
@@ -330,6 +406,7 @@ class CommandCodeProvider(BaseProvider):
         finish_reason: str | None,
         usage: Usage,
         model: str,
+        names: _ToolNames,
     ) -> ModelTurn:
         blocks: list = []
         text = "".join(text_parts)
@@ -343,7 +420,7 @@ class CommandCodeProvider(BaseProvider):
             blocks.append(
                 ToolCallBlock(
                     id=acc["id"],
-                    name=acc["name"],
+                    name=names.canonical(acc["name"]),
                     arguments=arguments,
                     parse_error=parse_error,
                 )
@@ -373,9 +450,10 @@ class CommandCodeProvider(BaseProvider):
     ) -> AsyncIterator[object]:
         url = f"{self._base}/messages"
         headers = self._headers("anthropic")
+        names = _ToolNames([tool.name for tool in tools or []])
         payload: dict[str, Any] = {
             "model": model,
-            "messages": _to_anthropic_messages(messages),
+            "messages": _to_anthropic_messages(messages, names),
             "max_tokens": max_tokens or self.settings.model_max_output_tokens,
             "stream": True,
         }
@@ -384,7 +462,7 @@ class CommandCodeProvider(BaseProvider):
         if tools:
             payload["tools"] = [
                 {
-                    "name": tool.name,
+                    "name": names.wire(tool.name),
                     "description": tool.description,
                     "input_schema": tool.input_schema or {"type": "object", "properties": {}},
                 }
@@ -405,7 +483,7 @@ class CommandCodeProvider(BaseProvider):
                 continue
             frame = self._parse_frame(data)
             if event_name == "error":
-                raise ProviderError(f"provider error: {frame}")
+                raise ProviderError(self._error_detail(frame.get("error") or frame))
             if event_name == "message_start":
                 message = frame.get("message") or {}
                 model_used = message.get("model") or model_used
@@ -424,7 +502,11 @@ class CommandCodeProvider(BaseProvider):
                     }
                     args_acc[index] = ""
                     if block.get("id") and block.get("name"):
-                        yield ToolCallStartEvent(index=index, id=block["id"], name=block["name"])
+                        yield ToolCallStartEvent(
+                            index=index,
+                            id=block["id"],
+                            name=names.canonical(block["name"]),
+                        )
                 else:
                     blocks[index] = {"type": "text", "parts": []}
             elif event_name == "content_block_delta":
@@ -459,7 +541,7 @@ class CommandCodeProvider(BaseProvider):
                 model_blocks.append(
                     ToolCallBlock(
                         id=entry["id"],
-                        name=entry["name"],
+                        name=names.canonical(entry["name"]),
                         arguments=arguments,
                         parse_error=parse_error,
                     )
@@ -538,13 +620,26 @@ async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]
         yield event or "message", "\n".join(data_lines)
 
 
+def _retry_delay(retry_after: str | None, default: float = 0.5, cap: float = 5.0) -> float:
+    if retry_after:
+        try:
+            return max(0.0, min(float(retry_after), cap))
+        except ValueError:
+            pass
+    return default
+
+
 def _usage_from_openai(raw: dict[str, Any]) -> Usage:
     prompt = int(raw.get("prompt_tokens") or 0)
     completion = int(raw.get("completion_tokens") or 0)
     return Usage(input_tokens=prompt, output_tokens=completion)
 
 
-def _to_openai_messages(messages: list[ProviderMessage], system: str | None) -> list[dict]:
+def _to_openai_messages(
+    messages: list[ProviderMessage],
+    system: str | None,
+    names: _ToolNames | None = None,
+) -> list[dict]:
     out: list[dict] = []
     if system:
         out.append({"role": "system", "content": system})
@@ -554,7 +649,16 @@ def _to_openai_messages(messages: list[ProviderMessage], system: str | None) -> 
                 {
                     "id": block.id,
                     "type": "function",
-                    "function": {"name": block.name, "arguments": json.dumps(block.arguments)},
+                    "function": {
+                        "name": (
+                            names.wire(block.name)
+                            if names
+                            else block.name
+                            if _WIRE_NAME.match(block.name)
+                            else _alias(block.name)
+                        ),
+                        "arguments": json.dumps(block.arguments),
+                    },
                 }
                 for block in message.blocks
                 if isinstance(block, ToolCallBlock)
@@ -578,7 +682,9 @@ def _to_openai_messages(messages: list[ProviderMessage], system: str | None) -> 
     return out
 
 
-def _to_anthropic_messages(messages: list[ProviderMessage]) -> list[dict]:
+def _to_anthropic_messages(
+    messages: list[ProviderMessage], names: _ToolNames | None = None
+) -> list[dict]:
     out: list[dict] = []
     for message in messages:
         content: list[dict] = []
@@ -590,7 +696,13 @@ def _to_anthropic_messages(messages: list[ProviderMessage]) -> list[dict]:
                     {
                         "type": "tool_use",
                         "id": block.id,
-                        "name": block.name,
+                        "name": (
+                            names.wire(block.name)
+                            if names
+                            else block.name
+                            if _WIRE_NAME.match(block.name)
+                            else _alias(block.name)
+                        ),
                         "input": block.arguments,
                     }
                 )

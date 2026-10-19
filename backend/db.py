@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import partial
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -19,26 +20,30 @@ class Base(DeclarativeBase):
     """Declarative base for all ORM models."""
 
 
-def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+def _set_sqlite_pragmas(dbapi_connection, _connection_record, *, timeout_ms=1000) -> None:
     cursor = dbapi_connection.cursor()
     try:
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute(f"PRAGMA busy_timeout={int(timeout_ms)}")
     finally:
         cursor.close()
 
 
 class Database:
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, *, busy_timeout_seconds: float = 1.0) -> None:
         self.url = url
         connect_args: dict[str, object] = {}
         if url.startswith("sqlite"):
-            connect_args = {"check_same_thread": False, "timeout": 30}
+            connect_args = {"check_same_thread": False, "timeout": busy_timeout_seconds}
         self.engine = create_engine(url, future=True, connect_args=connect_args)
         if url.startswith("sqlite"):
-            event.listen(self.engine, "connect", _set_sqlite_pragmas)
+            event.listen(
+                self.engine,
+                "connect",
+                partial(_set_sqlite_pragmas, timeout_ms=int(busy_timeout_seconds * 1000)),
+            )
         self.session_factory = sessionmaker(
             bind=self.engine, class_=Session, expire_on_commit=False
         )
@@ -60,6 +65,11 @@ class Database:
         from sqlalchemy import inspect, text
 
         additions: dict[str, dict[str, str]] = {
+            "tool_attempts": {
+                "arguments_json": "TEXT NOT NULL DEFAULT '{}'",
+                "reconciliation_note": "TEXT",
+                "reconciled_at": "DATETIME",
+            },
             "settings": {"unlimited_tools": "BOOLEAN NOT NULL DEFAULT 0"},
             "conversations": {
                 "title_source": "VARCHAR(16) DEFAULT 'legacy'",

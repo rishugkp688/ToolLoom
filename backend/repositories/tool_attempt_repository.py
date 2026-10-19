@@ -20,6 +20,7 @@ class ToolAttemptRepository:
         namespaced_name: str,
         arguments_digest: str,
         effect: str,
+        arguments_json: str = "{}",
     ) -> ToolAttempt:
         attempt = ToolAttempt(
             run_id=run_id,
@@ -27,6 +28,7 @@ class ToolAttemptRepository:
             namespaced_name=namespaced_name,
             arguments_digest=arguments_digest,
             effect=effect,
+            arguments_json=arguments_json,
             status=PENDING,
         )
         self.session.add(attempt)

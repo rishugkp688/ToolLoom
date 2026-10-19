@@ -26,7 +26,8 @@ from pydantic import ValidationError
 from backend.services.sandbox import foundry_tools, fs_tool, http_tool, search_tool
 from backend.services.sandbox.workspace import Workspace, workspace_for
 from backend.services.skills import read_skill_body
-from backend.services.task_service import PLAN_STATUSES
+from backend.services.task_service import PLAN_STATUSES, TASK_STATUSES
+from backend.services.tool_errors import ToolPreflightError
 from backend.services.tool_foundry import authoring
 from backend.services.tool_foundry.manifest import FoundryError
 
@@ -160,30 +161,35 @@ def _plan_read(arguments: dict[str, Any], ctx: ToolContext) -> str:
 
 def _plan_write(arguments: dict[str, Any], ctx: ToolContext) -> str:
     if ctx.tasks is None:
-        raise SandboxError("task state is unavailable in this build")
+        raise ToolPreflightError("task state is unavailable in this build")
     objective = arguments.get("objective")
     criteria = arguments.get("completion_criteria")
     raw_plan = arguments.get("plan")
-    if objective is None and criteria is None and raw_plan is None:
-        raise SandboxError("provide at least one of `plan`, `objective`, `completion_criteria`")
+    status = arguments.get("status")
+    if objective is None and criteria is None and raw_plan is None and status is None:
+        raise ToolPreflightError(
+            "provide at least one of `plan`, `objective`, `completion_criteria`, `status`"
+        )
+    if status is not None and status not in TASK_STATUSES:
+        raise ToolPreflightError(f"status must be one of {', '.join(TASK_STATUSES)}")
 
     plan = None
     if raw_plan is not None:
         if not isinstance(raw_plan, list) or len(raw_plan) > MAX_PLAN_STEPS:
-            raise SandboxError(f"plan must be a list of at most {MAX_PLAN_STEPS} steps")
+            raise ToolPreflightError(f"plan must be a list of at most {MAX_PLAN_STEPS} steps")
         plan = []
         for index, item in enumerate(raw_plan, start=1):
             if not isinstance(item, dict):
-                raise SandboxError(f"plan step {index} must be an object")
+                raise ToolPreflightError(f"plan step {index} must be an object")
             step = str(item.get("step") or "").strip()
-            status = str(item.get("status") or "pending")
+            step_status = str(item.get("status") or "pending")
             if not step:
-                raise SandboxError(f"plan step {index} needs a non-empty `step`")
-            if status not in PLAN_STATUSES:
-                raise SandboxError(
+                raise ToolPreflightError(f"plan step {index} needs a non-empty `step`")
+            if step_status not in PLAN_STATUSES:
+                raise ToolPreflightError(
                     f"plan step {index} status must be one of {', '.join(PLAN_STATUSES)}"
                 )
-            plan.append({"step": step[:500], "status": status})
+            plan.append({"step": step[:500], "status": step_status})
 
     task = ctx.tasks.revise(
         ctx.conversation_id,
@@ -191,9 +197,14 @@ def _plan_write(arguments: dict[str, Any], ctx: ToolContext) -> str:
         plan=plan,
         completion_criteria=criteria,
     )
+    if status is not None:
+        updated = ctx.tasks.set_status(ctx.conversation_id, status)
+        if updated is not None:
+            task = updated
     ctx.tasks.project_plan(ctx.workspace(), ctx.conversation_id)
     return json.dumps(
         {
+            "status": task.status,
             "objective_revision": task.objective_revision,
             "plan_revision": task.plan_revision,
             "plan": ctx.tasks.plan_of(task),
@@ -309,6 +320,14 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
                         },
                     },
                     "completion_criteria": {"type": "string", "maxLength": 1000},
+                    "status": {
+                        "type": "string",
+                        "enum": list(TASK_STATUSES),
+                        "description": (
+                            "Mark the task active or completed. Completing it records "
+                            "that the objective as written has been met."
+                        ),
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -369,8 +388,12 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
                 "type": "object",
                 "properties": {
                     "path": _PATH,
-                    "offset": {"type": "integer", "description": "1-based first line"},
-                    "limit": {"type": "integer", "description": "number of lines"},
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based first line",
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "description": "number of lines"},
                 },
                 "required": ["path"],
                 "additionalProperties": False,
@@ -379,13 +402,22 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
         ),
         SandboxTool(
             name="fs_write",
-            description="Create or append to a text file in the workspace.",
+            description=(
+                "Create or append to a text file in the workspace. A write replaces "
+                "the file atomically. Pass `expected_sha256` from a prior read/write "
+                "to refuse an overwrite after the file changed underneath you."
+            ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "path": _PATH,
                     "content": {"type": "string"},
                     "mode": {"type": "string", "enum": ["write", "append"]},
+                    "expected_sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-fA-F]{64}$",
+                        "description": "Optional revision check from a prior read/write",
+                    },
                 },
                 "required": ["path", "content"],
                 "additionalProperties": False,
@@ -527,9 +559,11 @@ LOCAL_SERVERS: dict[str, list[SandboxTool]] = {
         SandboxTool(
             name="foundry_install",
             description=(
-                "Validate a package and install it as a reusable capability. The tool is "
-                "registered disabled and unapproved; the operator enables it in Settings -> "
-                "Capabilities. Executes generated code, so it needs opt-in and approval."
+                "Validate a package and install it as a reusable capability. A fresh "
+                "install is registered disabled and unapproved; an identical reinstall "
+                "preserves the operator's existing enable/approval flags. The report states "
+                "the actual resulting state — trust that and attempt the call rather than "
+                "assuming a gate. Executes generated code, so it needs opt-in and approval."
             ),
             input_schema={
                 "type": "object",

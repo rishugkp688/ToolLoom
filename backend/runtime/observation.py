@@ -27,10 +27,19 @@ class ExecutionResult:
     duration_ms: int = 0
     validation_errors: list[str] = field(default_factory=list)
     truncated: bool = False
+    # The process exit status, kept separate from `is_error`. A command that ran and
+    # exited non-zero is a delivered result, not a broken transport call.
+    exit_code: int | None = None
+    # Set when the command ran but its verification role failed (non-zero exit).
+    verification_failed: bool = False
     # True when the failure happened after dispatch and cannot be proven not to have
     # taken effect (a timeout, a dropped response, a teardown error). The ledger
     # records these as "unknown" rather than "failed", so a repeat is not blind.
     outcome_uncertain: bool = False
+    # Set when the caller already wrote this result into the transcript in the same
+    # transaction as its settlement, so nobody writes it twice.
+    persisted: bool = False
+    attempt_id: str | None = None
 
 
 def truncate_head_tail(

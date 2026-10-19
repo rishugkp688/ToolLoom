@@ -3,10 +3,18 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.orm import Session
 
 from backend.models import Message
+
+
+class MessageTail(list):
+    """A bounded chronological suffix, including what the read could not retain."""
+
+    def __init__(self, rows=(), *, omitted_rows: int = 0):
+        super().__init__(rows)
+        self.omitted_rows = omitted_rows
 
 
 class MessageRepository:
@@ -54,6 +62,114 @@ class MessageRepository:
             .order_by(Message.created_at, Message.id)
         )
         return list(self.session.execute(stmt).scalars().all())
+
+    def list_from(self, conversation_id: str, offset: int = 0) -> list[Message]:
+        stmt = (
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at, Message.id)
+            .offset(max(0, offset))
+        )
+        return list(self.session.execute(stmt).scalars().all())
+
+    def list_tail(
+        self, conversation_id: str, *, offset: int = 0, max_chars: int = 60_000
+    ) -> list[Message]:
+        """The newest rows that fit a character bound, in chronological order.
+
+        Building a prompt does not need the whole audit log: only the active suffix
+        can influence what is sent. Reading newest-first keeps the cost tied to the
+        working set rather than to how long the conversation has lived.
+        """
+        offset = max(0, offset)
+        base = select(Message).where(Message.conversation_id == conversation_id)
+        # The summary cursor counts from the oldest end, never from the newest.
+        if offset:
+            boundary = self.session.execute(
+                select(Message.created_at, Message.id)
+                .where(Message.conversation_id == conversation_id)
+                .order_by(Message.created_at, Message.id)
+                .offset(offset)
+                .limit(1)
+            ).first()
+            if boundary is None:
+                return MessageTail()
+            base = base.where(tuple_(Message.created_at, Message.id) >= tuple_(*boundary))
+        total_rows = max(0, self.count(conversation_id) - offset)
+        kept: list[Message] = []
+        total = 0
+        position = 0
+        batch_size = 64
+        exhausted = False
+        while not exhausted:
+            stmt = (
+                base.order_by(Message.created_at.desc(), Message.id.desc())
+                .offset(position)
+                .limit(batch_size)
+            )
+            batch = list(self.session.execute(stmt).scalars().all())
+            if not batch:
+                break
+            for row in batch:
+                size = len(row.content or "") + len(row.content_blocks_json or "")
+                if kept and total + size > max_chars:
+                    exhausted = True
+                    break
+                kept.append(row)
+                total += size
+                position += 1
+            if len(batch) < batch_size:
+                break
+
+        # Never open the active suffix on a tool result whose call was cut off.
+        while kept and kept[-1].role == "tool":
+            stmt = (
+                base.order_by(Message.created_at.desc(), Message.id.desc())
+                .offset(position)
+                .limit(1)
+            )
+            older = self.session.execute(stmt).scalars().first()
+            if older is None:
+                break
+            kept.append(older)
+            position += 1
+        kept.reverse()
+        return MessageTail(kept, omitted_rows=max(0, total_rows - len(kept)))
+
+    def first_user(self, conversation_id: str) -> Message | None:
+        stmt = (
+            select(Message)
+            .where(Message.conversation_id == conversation_id, Message.role == "user")
+            .order_by(Message.created_at, Message.id)
+            .limit(1)
+        )
+        return self.session.execute(stmt).scalars().first()
+
+    def first_assistant(
+        self, conversation_id: str, *, end_turn_only: bool = False
+    ) -> Message | None:
+        stmt = select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.role == "assistant",
+            Message.content != "",
+        )
+        if end_turn_only:
+            stmt = stmt.where(Message.stop_reason == "end_turn")
+        stmt = stmt.order_by(Message.created_at, Message.id).limit(1)
+        return self.session.execute(stmt).scalars().first()
+
+    def latest_user(self, conversation_id: str, *, include_resume: bool = False) -> Message | None:
+        stmt = select(Message).where(
+            Message.conversation_id == conversation_id, Message.role == "user"
+        )
+        if not include_resume:
+            stmt = stmt.where(Message.is_resume.is_(False))
+        stmt = stmt.order_by(Message.created_at.desc(), Message.id.desc()).limit(1)
+        return self.session.execute(stmt).scalars().first()
+
+    def counts_by_conversation(self) -> dict[str, int]:
+        stmt = select(Message.conversation_id, func.count()).group_by(Message.conversation_id)
+        return {row[0]: int(row[1]) for row in self.session.execute(stmt).all()}
 
     def count(self, conversation_id: str) -> int:
         stmt = (

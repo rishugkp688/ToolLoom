@@ -19,6 +19,7 @@ StopReason = Literal[
     "max_tokens",
     "stop_sequence",
     "max_iterations",
+    "max_tool_calls",
     "loop_guard",
     "cancelled",
     "error",
@@ -69,6 +70,10 @@ class ToolResultBlock:
     content: str
     is_error: bool = False
     name: str | None = None
+    exit_code: int | None = None
+    verification_failed: bool | None = None
+    outcome_uncertain: bool = False
+    attempt_id: str | None = None
     type: Literal["tool_result"] = "tool_result"
 
 
@@ -170,6 +175,10 @@ def block_to_dict(block: Block) -> dict[str, Any]:
         "name": block.name,
         "content": block.content,
         "is_error": block.is_error,
+        "exit_code": block.exit_code,
+        "verification_failed": block.verification_failed,
+        "outcome_uncertain": block.outcome_uncertain,
+        "attempt_id": block.attempt_id,
     }
 
 
@@ -187,6 +196,10 @@ def block_from_dict(data: dict[str, Any]) -> Block:
             content=str(data.get("content", "")),
             is_error=bool(data.get("is_error", False)),
             name=data.get("name"),
+            exit_code=data.get("exit_code"),
+            verification_failed=data.get("verification_failed"),
+            outcome_uncertain=bool(data.get("outcome_uncertain", False)),
+            attempt_id=data.get("attempt_id"),
         )
     return TextBlock(text=str(data.get("text", "")))
 

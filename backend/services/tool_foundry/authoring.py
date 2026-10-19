@@ -12,6 +12,7 @@ asked for a capability, and every installed tool lands disabled and unapproved.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +56,18 @@ __RESULT_KEYS__    }
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    provided = sys.argv[1:] if argv is None else argv
+    if provided and provided[0] == "--toolloom-json":
+        if len(provided) != 2:
+            raise ValueError("--toolloom-json requires one JSON object")
+        data = json.loads(provided[1])
+        if not isinstance(data, dict):
+            raise ValueError("tool arguments must be an object")
+        defaults = __DEFAULTS_REPR__
+        defaults.update({key.replace("-", "_"): value for key, value in data.items()})
+        args = argparse.Namespace(**defaults)
+    else:
+        args = build_parser().parse_args(provided)
     result = run(args)
     if getattr(args, "format", "json") == "json":
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -69,13 +81,13 @@ if __name__ == "__main__":
     sys.exit(main())
 '''
 
-_FORMAT_ARGUMENT = '''    parser.add_argument(
+_FORMAT_ARGUMENT = """    parser.add_argument(
         "--format",
         choices=("json", "text"),
         default="json",
         help="output format (default: json)",
     )
-'''
+"""
 
 _TEST_TEMPLATE = '''"""Tests for __NAME__.
 
@@ -111,10 +123,43 @@ class Test__CLASS__(unittest.TestCase):
         result = run_cli(__SAMPLE_ARGS__)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsInstance(json.loads(result.stdout), dict)
+        self.assertEqual(json.loads(result.stdout), json.loads(__EXPECTED_REPR__))
 
     # Keep a case that reproduces the original script's output on a real
     # fixture. That comparison is what proves the conversion, so do not drop it.
 '''
+
+
+def _dest(prop: str) -> str:
+    return prop.replace("-", "_")
+
+
+def _validate_properties(properties: dict[str, Any]) -> None:
+    """Reject names argparse cannot represent, before writing a package."""
+    flags: dict[str, str] = {}
+    dests: dict[str, str] = {}
+    for prop in properties:
+        if not isinstance(prop, str) or not prop:
+            raise FoundryError("property names must be non-empty strings")
+        dest = _dest(prop)
+        if not dest.isidentifier() or prop.startswith("-"):
+            raise FoundryError(
+                f"property {prop!r} cannot be mapped to a CLI flag; use letters, "
+                "digits, underscores or hyphens, starting with a letter or underscore"
+            )
+        flag = prop.replace("_", "-")
+        if flag in {"help", "toolloom-json"}:
+            raise FoundryError(f"property {prop!r} collides with a reserved CLI flag")
+        if flag in flags:
+            raise FoundryError(
+                f"properties {flags[flag]!r} and {prop!r} map to the same --{flag} flag"
+            )
+        if dest in dests:
+            raise FoundryError(
+                f"properties {dests[dest]!r} and {prop!r} map to the same argument name"
+            )
+        flags[flag] = prop
+        dests[dest] = prop
 
 
 def _argparse_line(prop: str, spec: dict[str, Any], required: bool) -> str:
@@ -124,13 +169,17 @@ def _argparse_line(prop: str, spec: dict[str, Any], required: bool) -> str:
     # repr for both: a description containing a quote, backslash or newline used to
     # produce a CLI that did not compile.
     if kind == "boolean":
-        return f"    parser.add_argument({flag!r}, action=\"store_true\", help={help_text!r})\n"
+        return f'    parser.add_argument({flag!r}, action="store_true", help={help_text!r})\n'
     if kind == "integer":
         signature = "type=int"
     elif kind == "number":
         signature = "type=float"
+    elif kind == "object":
+        signature = "type=json.loads"
     elif kind == "array":
-        signature = 'action="append"'
+        item_type = (spec.get("items") or {}).get("type")
+        item = {"integer": "int", "number": "float", "object": "json.loads"}.get(item_type)
+        signature = f'type={item}, action="append"' if item else 'action="append"'
     else:
         signature = "type=str"
     required_text = "required=True, " if required else ""
@@ -138,21 +187,56 @@ def _argparse_line(prop: str, spec: dict[str, Any], required: bool) -> str:
 
 
 def _result_line(prop: str) -> str:
-    return f'        "{prop}": getattr(args, "{prop.replace("-", "_")}"),\n'
+    return f"        {prop!r}: getattr(args, {_dest(prop)!r}),\n"
 
 
 def _sample_arg(prop: str, spec: dict[str, Any]) -> str:
-    flag = '"--' + prop.replace("_", "-") + '"'
+    flag = "--" + prop.replace("_", "-")
     kind = spec.get("type", "string")
     if kind == "boolean":
-        return flag
+        return repr(flag)
     if kind == "integer":
-        return f"{flag}, \"1\""
+        return f'{flag!r}, "1"'
     if kind == "number":
-        return f"{flag}, \"1.0\""
+        return f'{flag!r}, "1.0"'
+    if kind == "object":
+        return f'{flag!r}, "{{}}"'
     if kind == "array":
-        return f"{flag}, \"example\""
-    return f'{flag}, "REPLACE_ME"'
+        return f'{flag!r}, "example"'
+    return f'{flag!r}, "REPLACE_ME"'
+
+
+def _sample_value(spec: dict) -> Any:
+    if "const" in spec:
+        return spec["const"]
+    if spec.get("enum"):
+        return spec["enum"][0]
+    if "default" in spec:
+        return spec["default"]
+    kind = spec.get("type", "string")
+    if kind == "null":
+        return None
+    if kind == "boolean":
+        return True
+    if kind in {"integer", "number"}:
+        value = max(1, spec.get("minimum", 1))
+        if "exclusiveMinimum" in spec:
+            value = max(value, spec["exclusiveMinimum"] + 1)
+        value = min(value, spec.get("maximum", value))
+        if "exclusiveMaximum" in spec:
+            value = min(value, spec["exclusiveMaximum"] - 1)
+        return int(value) if kind == "integer" else float(value)
+    if kind == "array":
+        count = max(1, spec.get("minItems", 0))
+        count = min(count, spec.get("maxItems", count))
+        return [_sample_value(spec.get("items") or {}) for _ in range(count)]
+    if kind == "object":
+        return {
+            key: _sample_value(value if isinstance(value, dict) else {})
+            for key, value in (spec.get("properties") or {}).items()
+        }
+    text = "example".ljust(spec.get("minLength", 0), "x")
+    return text[: spec.get("maxLength", len(text))]
 
 
 def scaffold_package(workspace, name: str, description: str, input_schema: dict) -> dict:
@@ -162,15 +246,25 @@ def scaffold_package(workspace, name: str, description: str, input_schema: dict)
         description=description,
         entrypoint=f"scripts/{name}.py",
         input_schema=input_schema,
+        argument_encoding="json",
         tests="tests",
     )
+    properties: dict[str, Any] = manifest.input_schema.get("properties") or {}
+    _validate_properties(properties)
+    sample_values = {
+        prop: _sample_value(spec if isinstance(spec, dict) else {})
+        for prop, spec in properties.items()
+    }
+    from backend.services.tool_executor import validate_arguments
+
+    if validate_arguments(manifest.input_schema, sample_values):
+        raise FoundryError("cannot generate a valid fixture for this schema; simplify constraints")
     package = authoring_package(workspace, manifest.name)
     scripts = package / "scripts"
     tests = package / "tests"
     scripts.mkdir(parents=True, exist_ok=True)
     tests.mkdir(parents=True, exist_ok=True)
 
-    properties: dict[str, Any] = manifest.input_schema.get("properties") or {}
     required = set(manifest.input_schema.get("required") or [])
     arguments = "".join(
         _argparse_line(prop, spec if isinstance(spec, dict) else {}, prop in required)
@@ -191,20 +285,29 @@ def scaffold_package(workspace, name: str, description: str, input_schema: dict)
         .replace("__FORMAT_ARG__", "" if "format" in properties else _FORMAT_ARGUMENT)
         .replace("__ARGUMENTS__", arguments)
         .replace("__RESULT_KEYS__", result_keys or '        "result": "TODO",\n')
+        .replace(
+            "__DEFAULTS_REPR__",
+            repr(
+                {
+                    _dest(prop): False
+                    if isinstance(spec, dict) and spec.get("type") == "boolean"
+                    else None
+                    for prop, spec in properties.items()
+                }
+            ),
+        )
     )
     script_path = package / manifest.entrypoint
     if not script_path.exists():
         script_path.write_text(script, encoding="utf-8")
 
-    sample = ", ".join(
-        _sample_arg(prop, spec if isinstance(spec, dict) else {})
-        for prop, spec in properties.items()
-    )
+    sample = f"'--toolloom-json', {json.dumps(sample_values)!r}"
     test_body = (
         _TEST_TEMPLATE.replace("__NAME__", manifest.name)
         .replace("__ENTRYPOINT__", manifest.entrypoint)
         .replace("__CLASS__", manifest.name.title().replace("_", ""))
         .replace("__SAMPLE_ARGS__", sample)
+        .replace("__EXPECTED_REPR__", repr(json.dumps(sample_values or {"result": "TODO"})))
     )
     test_path = tests / f"test_{manifest.name}.py"
     if not test_path.exists():
@@ -258,9 +361,7 @@ async def validate_package_async(workspace, name: str, settings) -> dict:
     }
 
 
-async def install_from_workspace(
-    workspace, name: str, settings, conversation_id: str
-) -> dict:
+async def install_from_workspace(workspace, name: str, settings, conversation_id: str) -> dict:
     package = _package_dir(workspace, name)
     report = validate_package(package)
     if not report.ok or report.manifest is None:
@@ -293,10 +394,12 @@ async def install_from_workspace(
         "digest": installed.digest,
         "tests_run": tests.tests_run,
         "directory": installed.directory.as_posix(),
+        # The installing tool reconciles the catalogue and replaces this with the
+        # state that actually resulted. Do not claim a live approval state here: an
+        # identical reinstall preserves the operator's existing flags.
         "activation": (
-            f"{installed.tool_name} is installed but DISABLED and NOT APPROVED. "
-            "The operator must enable and approve it in Settings -> Capabilities "
-            "before any model can call it."
+            "Installed into the capability store; the installer reports the "
+            "resulting enablement and approval state after reconciliation."
         ),
     }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import io
 import json
 import logging
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import Field
 
 from backend.runtime.events import DONE, AgentEvent
 from backend.schemas import (
@@ -18,10 +20,12 @@ from backend.schemas import (
     SendMessageRequest,
 )
 from backend.schemas.responses import SendMessageResponse, ToolCallTrace
+from backend.schemas.safe import SafeModel
 from backend.services import uploads as upload_service
 from backend.services.conversation_service import ConversationService
 from backend.services.sandbox.workspace import workspace_for
 from backend.services.uploads import UploadError
+from backend.utils.async_work import run_blocking
 
 logger = logging.getLogger(__name__)
 
@@ -101,24 +105,38 @@ def _result(final: dict) -> SendMessageResponse:
     )
 
 
-def _start(request, conversation_id, text, *, is_resume=False, user_text=None, attachments=None):
+async def _start(
+    request, conversation_id, text, *, is_resume=False, user_text=None, attachments=None
+):
     active = request.app.state.active_runs
     if conversation_id in active:
         raise HTTPException(status_code=409, detail="conversation already has an active run")
     if len(active) >= 16:
         raise HTTPException(status_code=429, detail="too many active runs; try again shortly")
-    if (
-        _service(request).add_user_message(
-            conversation_id, text, is_resume=is_resume, user_text=user_text, attachments=attachments
-        )
-        is None
-    ):
-        raise HTTPException(status_code=404, detail="conversation not found")
+    # Reserve before yielding to storage so two requests cannot both be admitted.
     active.add(conversation_id)
+    try:
+        saved = await run_blocking(
+            _service(request).add_user_message,
+            conversation_id,
+            text,
+            is_resume=is_resume,
+            user_text=user_text,
+            attachments=attachments,
+        )
+        if saved is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+    except BaseException:
+        active.discard(conversation_id)
+        raise
 
 
 async def _events(request, conversation_id, model_id):
     finished = None
+    # Name the conversation now, from the first message, rather than after the run.
+    # A run that takes minutes used to leave the provisional title on screen the whole
+    # time; the title service ignores its own repeat calls via a cooldown.
+    _schedule_title(request, conversation_id, model_id)
     try:
         async with asyncio.timeout(request.app.state.settings.toolloom_run_timeout_seconds):
             async for event in request.app.state.runtime.run_stream(
@@ -203,6 +221,15 @@ def list_conversations(request: Request) -> list[dict]:
     return _service(request).list()
 
 
+@router.get("/{conversation_id}/meta", response_model=ConversationSummary)
+def get_conversation_meta(conversation_id: str, request: Request) -> dict:
+    """Header metadata only, for cheap title polling while a run streams."""
+    meta = _service(request).meta(conversation_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return meta
+
+
 @router.get("/{conversation_id}", response_model=ConversationDetail)
 def get_conversation(conversation_id: str, request: Request) -> dict:
     detail = _service(request).get(conversation_id)
@@ -234,31 +261,35 @@ async def delete_conversation(conversation_id: str, request: Request) -> None:
 async def send_message(
     conversation_id: str, body: SendMessageRequest, request: Request
 ) -> SendMessageResponse:
-    if _service(request).get(conversation_id) is None:
+    if await run_blocking(_service(request).meta, conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
-    text, attachments = _with_attachments(request, conversation_id, body.message, body.attachments)
-    _start(request, conversation_id, text, user_text=body.message, attachments=attachments)
+    text, attachments = await run_blocking(
+        _with_attachments, request, conversation_id, body.message, body.attachments
+    )
+    await _start(request, conversation_id, text, user_text=body.message, attachments=attachments)
     return _result(await _drain(request, conversation_id, body.model_id))
 
 
 @router.post("/{conversation_id}/messages/stream")
 async def stream_message(conversation_id: str, body: SendMessageRequest, request: Request):
-    if _service(request).get(conversation_id) is None:
+    if await run_blocking(_service(request).meta, conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
-    text, attachments = _with_attachments(request, conversation_id, body.message, body.attachments)
-    _start(request, conversation_id, text, user_text=body.message, attachments=attachments)
+    text, attachments = await run_blocking(
+        _with_attachments, request, conversation_id, body.message, body.attachments
+    )
+    await _start(request, conversation_id, text, user_text=body.message, attachments=attachments)
     return _RunResponse(request, conversation_id, body.model_id)
 
 
 @router.post("/{conversation_id}/continue", response_model=SendMessageResponse)
 async def continue_turn(conversation_id: str, request: Request, model_id: str | None = None):
-    _start(request, conversation_id, CONTINUE_PROMPT, is_resume=True)
+    await _start(request, conversation_id, CONTINUE_PROMPT, is_resume=True)
     return _result(await _drain(request, conversation_id, model_id))
 
 
 @router.post("/{conversation_id}/continue/stream")
 async def continue_stream(conversation_id: str, request: Request, model_id: str | None = None):
-    _start(request, conversation_id, CONTINUE_PROMPT, is_resume=True)
+    await _start(request, conversation_id, CONTINUE_PROMPT, is_resume=True)
     return _RunResponse(request, conversation_id, model_id)
 
 
@@ -314,8 +345,28 @@ def list_runs(conversation_id: str, request: Request) -> dict:
         }
 
 
+class ReconcileRequest(SafeModel):
+    note: str = Field(default="Operator checked the current state", min_length=1, max_length=2000)
+
+
+@router.get("/{conversation_id}/attempts")
+def list_uncertain_attempts(conversation_id: str, request: Request) -> dict:
+    if _service(request).meta(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    rows = request.app.state.runtime.ledger.uncertain_details(conversation_id)
+    redact = request.app.state.tool_executor._redact_arguments
+    for row in rows:
+        row["arguments"] = redact(row["arguments"])
+    return {"attempts": rows}
+
+
 @router.post("/{conversation_id}/attempts/{attempt_id}/reconcile", status_code=204)
-def reconcile_attempt(conversation_id: str, attempt_id: str, request: Request) -> None:
+def reconcile_attempt(
+    conversation_id: str,
+    attempt_id: str,
+    request: Request,
+    body: ReconcileRequest | None = None,
+) -> None:
     """Resolve an uncertain tool outcome after the operator has checked it.
 
     Deliberately human-driven. The runtime cannot know whether a side effect landed,
@@ -327,7 +378,15 @@ def reconcile_attempt(conversation_id: str, attempt_id: str, request: Request) -
     known = {item["id"] for item in ledger.describe_conversation(conversation_id)["uncertain"]}
     if attempt_id not in known:
         raise HTTPException(status_code=404, detail="attempt not found or already settled")
-    ledger.mark_reconciled(attempt_id)
+    if conversation_id in request.app.state.active_runs:
+        raise HTTPException(status_code=409, detail="stop the active run before reconciling")
+    if request.app.state.mcp_connection_manager.workspace_busy(
+        _workspace(request, conversation_id).root
+    ):
+        raise HTTPException(
+            status_code=409, detail="a local operation is still finishing; retry shortly"
+        )
+    ledger.mark_reconciled(attempt_id, (body or ReconcileRequest()).note)
 
 
 @router.post("/{conversation_id}/files", status_code=201)
@@ -364,21 +423,30 @@ def list_workspace(conversation_id: str, request: Request) -> dict:
     if _service(request).get(conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     workspace = _workspace(request, conversation_id)
-    entries = []
-    for path in sorted(workspace.root.rglob("*")):
-        if not path.is_file() or workspace.is_hidden(path):
+    # Keep the 500 newest without materialising every path or sorting the whole tree.
+    entries: list[tuple[float, str, int]] = []
+    for path in workspace.iter_files(for_export=True):
+        try:
+            stat = path.stat()
+        except OSError:
             continue
-        stat = path.stat()
-        entries.append(
+        item = (stat.st_mtime, workspace.relative(path), stat.st_size)
+        if len(entries) < 500:
+            heapq.heappush(entries, item)
+        elif item > entries[0]:
+            heapq.heapreplace(entries, item)
+    entries.sort(reverse=True)
+    return {
+        "files": [
             {
-                "name": path.name,
-                "path": workspace.relative(path),
-                "size_bytes": stat.st_size,
-                "modified_at": stat.st_mtime,
+                "name": Path(relative).name,
+                "path": relative,
+                "size_bytes": size,
+                "modified_at": modified,
             }
-        )
-    entries.sort(key=lambda item: item["modified_at"], reverse=True)
-    return {"files": entries[:500]}
+            for modified, relative, size in entries
+        ]
+    }
 
 
 @router.get("/{conversation_id}/workspace/download")
@@ -404,10 +472,11 @@ def download_workspace_archive(conversation_id: str, request: Request) -> Stream
 
     files: list[tuple[str, Path]] = []
     total = 0
-    for path in sorted(workspace.root.rglob("*")):
-        if not path.is_file() or workspace.is_hidden(path):
+    for path in workspace.iter_files(for_export=True):
+        try:
+            total += path.stat().st_size
+        except OSError:
             continue
-        total += path.stat().st_size
         if total > MAX_ARCHIVE_BYTES:
             raise HTTPException(
                 status_code=413,

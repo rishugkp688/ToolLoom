@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
+
+from backend.schemas.safe import SafeModel
 
 
-class CreateConversationRequest(BaseModel):
+class CreateConversationRequest(SafeModel):
     # Unknown fields are rejected rather than ignored: a client that sends
     # {"message": ...} here should get an error, not an empty conversation.
     model_config = ConfigDict(extra="forbid")
     title: str | None = Field(default=None, max_length=255)
 
 
-class SendMessageRequest(BaseModel):
+class SendMessageRequest(SafeModel):
     model_config = ConfigDict(extra="forbid")
     message: str = Field(min_length=0, max_length=200_000, default="")
     model_id: str | None = None
@@ -23,7 +25,7 @@ class SendMessageRequest(BaseModel):
         return self
 
 
-class CreateMCPServerRequest(BaseModel):
+class CreateMCPServerRequest(SafeModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=64)
     # `local` and `generated` are runtime-owned; the registry rejects those with a
@@ -42,7 +44,7 @@ class CreateMCPServerRequest(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
 
 
-class UpdateMCPServerRequest(BaseModel):
+class UpdateMCPServerRequest(SafeModel):
     # Strict: a typo such as {"verify_ssl"} must fail rather than silently leave a
     # security setting unchanged while reporting success.
     model_config = ConfigDict(extra="forbid")
@@ -53,7 +55,7 @@ class UpdateMCPServerRequest(BaseModel):
     timeout_ms: int | None = Field(default=None, ge=1_000, le=600_000)
 
 
-class UpdateToolRequest(BaseModel):
+class UpdateToolRequest(SafeModel):
     # Strict: {"enable": true} (a typo for enabled) must not return 200 and quietly
     # leave a tool disabled or unapproved.
     model_config = ConfigDict(extra="forbid")

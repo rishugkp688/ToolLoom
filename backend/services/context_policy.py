@@ -28,6 +28,7 @@ from backend.services.context_builder import (
     ContextBuilder,
     UsageAnchor,
 )
+from backend.utils.async_work import run_blocking
 
 
 class ContextPolicy:
@@ -54,20 +55,25 @@ class ContextPolicy:
         """
         builder = ContextBuilder(self.db, self.settings, budget)
         try:
-            built = builder.build(
-                conversation_id, advisory=advisory, pinned=pinned, anchor=anchor, allow_drop=False
+            built = await run_blocking(
+                builder.build,
+                conversation_id,
+                advisory=advisory,
+                pinned=pinned,
+                anchor=anchor,
+                allow_drop=False,
             )
         except ContextBudgetError:
             pass
         else:
             # Pruning is a reduction too, and the caller should be able to say so
             # rather than reporting that nothing happened.
-            return built, ("pruned" if built.pruned_results else None)
+            return built, ("pruned" if built.pruned_results or built.projected_exchanges else None)
 
         if self.compactor is None:
             # No summariser available, so fall through to trimming.
-            return builder.build(
-                conversation_id, advisory=advisory, pinned=pinned, anchor=anchor
+            return await run_blocking(
+                builder.build, conversation_id, advisory=advisory, pinned=pinned, anchor=anchor
             ), "trimmed"
 
         # Summarising preserves facts that dropping would lose, so it goes first.
@@ -75,7 +81,9 @@ class ContextPolicy:
         summarised = await self.compactor.compact_if_needed(
             conversation_id, model_id=model_id, budget=budget, force=True
         )
-        built = builder.build(conversation_id, advisory=advisory, pinned=pinned, anchor=anchor)
-        if built.dropped_units:
-            return built, "summarised+trimmed"
+        built = await run_blocking(
+            builder.build, conversation_id, advisory=advisory, pinned=pinned, anchor=anchor
+        )
+        if built.dropped_units or built.omitted_rows or built.projected_exchanges:
+            return built, "summarised+trimmed" if summarised else "trimmed"
         return built, "summarised" if summarised else "trimmed"

@@ -22,7 +22,16 @@ from backend.utils.errors import flatten_error
 
 
 class MCPError(RuntimeError):
-    """Normalized transport/dispatch failure for an MCP operation."""
+    """Normalized transport/dispatch failure for an MCP operation.
+
+    ``stage`` records where the failure happened, because that decides what may be
+    safely retried: a pre-send failure cannot have had an effect, a dispatch-stage
+    failure might have, and a cleanup failure happened after a successful result.
+    """
+
+    def __init__(self, message: str, *, stage: str | None = None) -> None:
+        super().__init__(message)
+        self.stage = stage
 
 
 @dataclass
@@ -36,6 +45,9 @@ class DiscoveredTool:
 class ToolCallOutcome:
     text: str
     is_error: bool = False
+    outcome_uncertain: bool = False
+    exit_code: int | None = None
+    verification_failed: bool = False
 
 
 def _client_factory(verify_ssl: bool):
@@ -64,31 +76,52 @@ async def open_session(
     args: list[str] | None = None,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
+    deadline: bool = True,
 ):
-    """Open, initialize and yield one MCP client session."""
+    """Open, initialize and yield one MCP client session.
+
+    ``deadline=False`` is for a supervised session that deliberately outlives the
+    call that opened it; the caller applies a per-operation timeout instead.
+    """
     headers = headers or {}
     read_timeout = max(5.0, timeout_ms / 1000.0)
     factory = _client_factory(verify_ssl)
     if not verify_ssl:
-        raise MCPError("TLS verification cannot be disabled")
+        raise MCPError("TLS verification cannot be disabled", stage="pre_send")
+    stage = "pre_send"
+
+    @asynccontextmanager
+    async def run():
+        nonlocal stage
+        async with _open_transport(
+            url=url,
+            headers=headers,
+            transport=transport,
+            command=command,
+            args=args,
+            cwd=cwd,
+            env=env,
+            read_timeout=read_timeout,
+            factory=factory,
+        ) as session:
+            stage = "dispatch"
+            yield session
+            stage = "cleanup"
+
     try:
-        with anyio.fail_after(timeout_ms / 1000):
-            async with _open_transport(
-                url=url,
-                headers=headers,
-                transport=transport,
-                command=command,
-                args=args,
-                cwd=cwd,
-                env=env,
-                read_timeout=read_timeout,
-                factory=factory,
-            ) as session:
+        if deadline:
+            with anyio.fail_after(timeout_ms / 1000):
+                async with run() as session:
+                    yield session
+        else:
+            async with run() as session:
                 yield session
-    except MCPError:
-        raise
+    except MCPError as exc:
+        if exc.stage:
+            raise
+        raise MCPError(str(exc), stage=stage) from exc
     except Exception as exc:
-        raise MCPError(_describe(exc)) from exc
+        raise MCPError(_describe(exc), stage=stage) from exc
 
 
 @asynccontextmanager
@@ -160,28 +193,41 @@ async def list_tools(
         cwd=cwd,
         env=env,
     ) as session:
-        tools: list[DiscoveredTool] = []
-        cursor = None
-        seen = set()
-        for _ in range(100):
-            result = await session.list_tools(cursor=cursor)
-            for tool in result.tools:
-                if tool.name in seen:
-                    raise MCPError("duplicate tool name in discovery")
-                seen.add(tool.name)
-                tools.append(
-                    DiscoveredTool(
-                        name=tool.name,
-                        description=tool.description or "",
-                        input_schema=tool.inputSchema,
-                    )
+        return await list_tools_on(session)
+
+
+async def list_tools_on(session: ClientSession) -> list[DiscoveredTool]:
+    """Discover tools over an already-open session."""
+    tools: list[DiscoveredTool] = []
+    cursor = None
+    seen = set()
+    for _ in range(100):
+        result = await session.list_tools(cursor=cursor)
+        for tool in result.tools:
+            if tool.name in seen:
+                raise MCPError("duplicate tool name in discovery")
+            seen.add(tool.name)
+            tools.append(
+                DiscoveredTool(
+                    name=tool.name,
+                    description=tool.description or "",
+                    input_schema=tool.inputSchema,
                 )
-            cursor = result.nextCursor
-            if not cursor:
-                break
-        else:
-            raise MCPError("tool discovery exceeded 100 pages")
-        return tools
+            )
+        cursor = result.nextCursor
+        if not cursor:
+            break
+    else:
+        raise MCPError("tool discovery exceeded 100 pages")
+    return tools
+
+
+async def call_tool_on(
+    session: ClientSession, tool_name: str, arguments: dict[str, Any]
+) -> ToolCallOutcome:
+    """Call a tool over an already-open, supervised session."""
+    result = await session.call_tool(tool_name, arguments)
+    return ToolCallOutcome(text=_content_to_text(result), is_error=bool(result.isError))
 
 
 async def call_tool(
@@ -198,19 +244,35 @@ async def call_tool(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
 ) -> ToolCallOutcome:
-    async with open_session(
-        url=url,
-        headers=headers,
-        timeout_ms=timeout_ms,
-        verify_ssl=verify_ssl,
-        transport=transport,
-        command=command,
-        args=args,
-        cwd=cwd,
-        env=env,
-    ) as session:
-        result = await session.call_tool(tool_name, arguments)
-        return ToolCallOutcome(text=_content_to_text(result), is_error=bool(result.isError))
+    outcome: ToolCallOutcome | None = None
+    try:
+        async with open_session(
+            url=url,
+            headers=headers,
+            timeout_ms=timeout_ms,
+            verify_ssl=verify_ssl,
+            transport=transport,
+            command=command,
+            args=args,
+            cwd=cwd,
+            env=env,
+        ) as session:
+            try:
+                result = await session.call_tool(tool_name, arguments)
+            except MCPError:
+                raise
+            except Exception as exc:
+                # The request may have reached the server before this failed.
+                raise MCPError(_describe(exc), stage="dispatch") from exc
+            outcome = ToolCallOutcome(
+                text=_content_to_text(result), is_error=bool(result.isError)
+            )
+    except MCPError:
+        # A teardown error must not discard a result the server already returned.
+        if outcome is not None:
+            return outcome
+        raise
+    return outcome
 
 
 def _content_to_text(result: Any) -> str:

@@ -11,6 +11,7 @@ import json
 from backend.repositories import ConversationRepository, MessageRepository
 from backend.services.context_builder import estimate_tokens
 from backend.services.model_catalogue import ModelBudget, budget_for
+from backend.utils.async_work import run_blocking
 
 MAX_SUMMARY_TOKENS = 1_500
 
@@ -43,43 +44,59 @@ class ContextCompactor:
         whereas shedding exchanges loses them; it should therefore be tried first.
         """
         budget = budget or budget_for(self.settings)
-        with self.db.session() as session:
-            conversation = ConversationRepository(session).get(conversation_id)
-            if conversation is None:
-                return False
-            rows = MessageRepository(session).list_by_conversation(conversation_id)
-            summary_count = conversation.summary_message_count or 0
-            pending = rows[summary_count:]
-            pending_tokens = estimate_tokens(_to_messages(pending), None, [])
-            previous = conversation.summary or ""
-            if not force and pending_tokens + len(previous) // 4 < int(budget.input_tokens * 0.75):
-                return False
-            cutoff = _cutoff_index(pending, max(1, int(budget.input_tokens * 0.3)))
-            if cutoff <= 0:
-                return False
-            head = pending[:cutoff]
-            # Advance the cursor only over messages the summarizer can actually
-            # receive. Truncating the input and then marking the whole head as
-            # summarised silently loses the tail from every future context.
-            max_chars = max(1, _summary_input_chars(budget) - len(previous) - 32)
-            while len(head) > 1 and len(_render(head)) > max_chars:
-                head.pop()
-            if not head:
-                return False
-            head_text = _render(head)
-            if len(head_text) > max_chars:
-                return False
+        prepared = await run_blocking(self._prepare_head, conversation_id, budget, force)
+        if prepared is None:
+            return False
+        previous, head_text, summary_count, head_count = prepared
 
         summary = await self._summarize(previous, head_text, model_id, budget)
         if not summary:
             return False
 
+        return await run_blocking(
+            self._store_summary, conversation_id, summary_count, head_count, summary
+        )
+
+    def _prepare_head(self, conversation_id, budget, force):
         with self.db.session() as session:
             conversation = ConversationRepository(session).get(conversation_id)
             if conversation is None:
+                return None
+            summary_count = conversation.summary_message_count or 0
+            # Already-summarised rows cannot affect the next summary.
+            pending = MessageRepository(session).list_from(conversation_id, offset=summary_count)
+            pending_tokens = estimate_tokens(_to_messages(pending), None, [])
+            previous = conversation.summary or ""
+            if not force and pending_tokens + len(previous) // 4 < int(budget.input_tokens * 0.75):
+                return None
+            cutoff = _cutoff_index(pending, max(1, int(budget.input_tokens * 0.3)))
+            # Shrink in complete exchange units. Popping individual rows could
+            # summarise an assistant call while leaving its result in the retained
+            # suffix — an orphan every strict provider rejects.
+            cutoff = _snap_to_boundary(pending, cutoff)
+            if cutoff <= 0:
+                return None
+            units = _units(pending[:cutoff])
+            # Advance the cursor only over messages the summarizer can actually
+            # receive. Truncating the input and then marking the whole head as
+            # summarised silently loses the tail from every future context.
+            max_chars = max(0, _summary_input_chars(budget) - len(_summary_input(previous, "")))
+            while units and len(_render(_flatten(units))) > max_chars:
+                units.pop()
+            if not units:
+                return None
+            head = _flatten(units)
+            head_text = _render(head)
+
+        return previous, head_text, summary_count, len(head)
+
+    def _store_summary(self, conversation_id, summary_count, head_count, summary):
+        with self.db.session() as session:
+            conversation = ConversationRepository(session).get(conversation_id)
+            if conversation is None or (conversation.summary_message_count or 0) != summary_count:
                 return False
             conversation.summary = summary
-            conversation.summary_message_count = summary_count + len(head)
+            conversation.summary_message_count = summary_count + head_count
             session.flush()
         return True
 
@@ -91,18 +108,16 @@ class ContextCompactor:
         )
 
         provider: BaseProvider = self.provider
-        prompt = head_text
-        if previous:
-            prompt = f"Existing summary:\n{previous}\n\nNewer messages:\n{head_text}"
-        max_chars = max(1, (budget.input_tokens - len(SUMMARY_PROMPT) // 4 - 64) * 3)
-        if len(prompt) > max_chars:
-            prompt = prompt[:max_chars] + "\n[summary input excerpt truncated]"
+        prompt = _summary_input(previous, head_text)
+        if len(prompt) > _summary_input_chars(budget):
+            return ""
+        output_limit = min(MAX_SUMMARY_TOKENS, budget.max_output_tokens)
         try:
             turn = await provider.complete(
                 messages=[ProviderMessage("user", [TextBlock(prompt)])],
                 system=SUMMARY_PROMPT,
                 model_id=model_id or getattr(provider, "model_id", None),
-                max_tokens=min(MAX_SUMMARY_TOKENS, budget.max_output_tokens),
+                max_tokens=output_limit,
             )
         except Exception:
             return ""
@@ -116,7 +131,14 @@ class ContextCompactor:
         text = turn.text.strip()
         if not text:
             return ""
-        return text[: min(MAX_SUMMARY_TOKENS, budget.max_output_tokens) * 4]
+        # The output allowance is a contract. If the provider ignores it, the
+        # summary may not cover everything it was given, so reject it rather than
+        # slice the text and advance the cursor as though it did.
+        if turn.usage.output_tokens and turn.usage.output_tokens > output_limit:
+            return ""
+        if len(text) > output_limit * 4:
+            return ""
+        return text
 
 
 def _to_messages(rows) -> list:
@@ -127,7 +149,7 @@ def _to_messages(rows) -> list:
 
 def _blocks(row) -> list[dict]:
     try:
-        blocks = json.loads(row.content_blocks_json or "[]")
+        blocks = json.loads(getattr(row, "content_blocks_json", None) or "[]")
     except json.JSONDecodeError:
         return []
     if not isinstance(blocks, list):
@@ -163,6 +185,40 @@ def _render(rows) -> str:
 
 def _summary_input_chars(budget: ModelBudget) -> int:
     return max(1, (budget.input_tokens - len(SUMMARY_PROMPT) // 4 - 64) * 3)
+
+
+def _summary_input(previous: str, head: str) -> str:
+    return f"Existing summary:\n{previous}\n\nNewer messages:\n{head}" if previous else head
+
+
+def _row_has_tool_use(row) -> bool:
+    return any(block.get("type") == "tool_use" for block in _blocks(row))
+
+
+def _units(rows: list) -> list[list]:
+    """Group rows into complete exchanges: a call together with its results."""
+    units: list[list] = []
+    for row in rows:
+        if row.role == "tool" and units and any(_row_has_tool_use(item) for item in units[-1]):
+            units[-1].append(row)
+        else:
+            units.append([row])
+    return units
+
+
+def _flatten(units: list[list]) -> list:
+    return [row for unit in units for row in unit]
+
+
+def _snap_to_boundary(rows: list, index: int) -> int:
+    """The largest exchange boundary at or before ``index``."""
+    boundary = 0
+    for unit in _units(rows):
+        next_boundary = boundary + len(unit)
+        if next_boundary > index:
+            break
+        boundary = next_boundary
+    return boundary
 
 
 def _cutoff_index(pending: list, recent_tokens: int) -> int:

@@ -36,8 +36,10 @@ def _scalar(value: Any) -> str:
 
 def build_argv(package: InstalledPackage, arguments: dict[str, Any]) -> list[str]:
     """Map schema properties onto ``--flag value`` pairs, in a stable order."""
-    properties = (package.manifest.input_schema.get("properties") or {})
+    properties = package.manifest.input_schema.get("properties") or {}
     argv = [sys.executable, "-s", "-u", "-X", "utf8", str(package.entrypoint)]
+    if getattr(package.manifest, "argument_encoding", "flags") == "json":
+        return [*argv, "--toolloom-json", json.dumps(arguments, allow_nan=False)]
     for key in sorted(properties):
         if key not in arguments:
             continue
@@ -50,27 +52,32 @@ def build_argv(package: InstalledPackage, arguments: dict[str, Any]) -> list[str
             continue
         elif isinstance(value, list):
             for item in value:
-                argv.extend([flag, _scalar(item)])
+                argv.append(f"{flag}={_scalar(item)}")
         else:
-            argv.extend([flag, _scalar(value)])
+            argv.append(f"{flag}={_scalar(value)}")
     return argv
 
 
 def _failure(package: InstalledPackage, result) -> ToolCallOutcome:
     if result.stop_reason == "timeout":
         return ToolCallOutcome(
-            text=f"{package.manifest.name} timed out and was terminated", is_error=True
+            text=f"{package.manifest.name} timed out and was terminated",
+            is_error=True,
+            outcome_uncertain=True,
         )
     if result.stop_reason == "output_limit":
         return ToolCallOutcome(
             text=f"{package.manifest.name} exceeded the output limit and was terminated",
             is_error=True,
+            outcome_uncertain=True,
         )
     detail = result.stderr.strip() or result.stdout.strip() or "(no output)"
     return ToolCallOutcome(
         text=f"{package.manifest.name} exited with code {result.exit_code}\n\n"
         f"{detail[-MAX_STDERR_CHARS:]}",
         is_error=True,
+        exit_code=result.exit_code,
+        verification_failed=True,
     )
 
 
@@ -86,9 +93,7 @@ async def run_installed(
             is_error=True,
         )
 
-    timeout = float(
-        package.manifest.timeout_seconds or settings.toolloom_foundry_timeout_seconds
-    )
+    timeout = float(package.manifest.timeout_seconds or settings.toolloom_foundry_timeout_seconds)
     result = await run_argv(
         build_argv(package, arguments),
         cwd=str(ctx.workspace().root),

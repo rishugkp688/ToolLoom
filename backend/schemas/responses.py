@@ -25,6 +25,7 @@ class ModelInfo(BaseModel):
 class ConversationSummary(BaseModel):
     id: str
     title: str | None = None
+    title_source: str | None = None
     created_at: datetime
     updated_at: datetime
     message_count: int = 0
@@ -89,6 +90,10 @@ class ToolCallTrace(BaseModel):
     output_text: str = ""
     attempts: int = 1
     duration_ms: int = 0
+    exit_code: int | None = None
+    verification_failed: bool = False
+    outcome_uncertain: bool = False
+    attempt_id: str | None = None
 
 
 class SendMessageResponse(BaseModel):

@@ -367,7 +367,8 @@ function isErrorResult(result) {
 
 function entryElement(data) {
   const status = data.state;
-  const glyph = status === "ok" ? "✓" : status === "error" ? "✕" : "…";
+  const glyph =
+    status === "ok" ? "✓" : status === "error" ? "✕" : status === "failed" ? "!" : "…";
   const el = document.createElement("div");
   el.className = "entry";
   el.dataset.open = "false";
@@ -402,11 +403,25 @@ function entryElement(data) {
   return el;
 }
 
+function verificationFailed(result) {
+  if (!result) return false;
+  const outcome = (result.blocks || []).find(block => block.type === "tool_result");
+  if (typeof outcome?.verification_failed === "boolean") return outcome.verification_failed;
+  try {
+    const payload = JSON.parse(result.content);
+    return typeof payload.exit_code === "number" && payload.exit_code !== 0;
+  } catch (_) {
+    return false;
+  }
+}
+
 function entryFromToolUse(block, result) {
   return {
     name: block.name,
     input: block.arguments || {},
-    state: result ? (isErrorResult(result) ? "error" : "ok") : "running",
+    state: result
+      ? (isErrorResult(result) ? "error" : verificationFailed(result) ? "failed" : "ok")
+      : "running",
     output: result ? result.content : "",
   };
 }
@@ -561,6 +576,7 @@ async function streamRun(url, payload, { userText = null, attachments = [] } = {
   const controller = new AbortController();
   state.controller = controller;
   state.running = true;
+  startTitleWatch(runSessionId);
   $("sendBtn").disabled = true;
   $("unlimitedTools").disabled = true;
   $("stopBtn").hidden = false;
@@ -640,17 +656,22 @@ async function streamRun(url, payload, { userText = null, attachments = [] } = {
       announce(`Running tool ${data.name}`);
       scrollLog();
     } else if (event === "tool_call_end") {
+      const toolState = data.is_error
+        ? "error"
+        : data.verification_failed
+          ? "failed"
+          : "ok";
       const resolved = entryElement({
         name: data.name,
         input: data.input || {},
-        state: data.is_error ? "error" : "ok",
+        state: toolState,
         output: data.output_text || "",
       });
       const pendingEntry = pendingEntries.get(data.tool_call_id);
       if (pendingEntry && pendingEntry.parentElement) pendingEntry.replaceWith(resolved);
       else if (entriesWrap) entriesWrap.appendChild(resolved);
       pendingEntries.delete(data.tool_call_id);
-      announce(`Tool ${data.name} ${data.is_error ? "failed" : "finished"}`);
+      announce(`Tool ${data.name} ${toolState === "ok" ? "finished" : toolState}`);
       scrollLog();
     } else if (event === "step_note") {
       toast(data.message || "Loop guard fired");
@@ -661,7 +682,7 @@ async function streamRun(url, payload, { userText = null, attachments = [] } = {
       activity.summary.textContent = `Tool activity · ${liveToolCount} ${liveToolCount === 1 ? "call" : "calls"}`;
       updateReadout(data);
       state.lastStop = data.stop_reason;
-      setContinue(["max_tokens", "max_iterations", "loop_guard"].includes(data.stop_reason));
+      setContinue(RESUMABLE_STOPS.has(data.stop_reason));
       const failed = data.stop_reason === "error";
       setState(failed ? "error" : "done");
       if (failed) { streamFailed = true; setContinue(true); }
@@ -718,12 +739,61 @@ async function streamRun(url, payload, { userText = null, attachments = [] } = {
     $("stopBtn").hidden = true;
     setContinue(state.canContinue);
     live.classList.remove("turn--live");
+    // A bounded grace period lets the post-run title helper land; the watcher
+    // still stops as soon as the title settles or the deadline expires.
+    titleWatchDeadline = Date.now() + 8_000;
     try { await refreshSession(runSessionId); }
     finally {
       if (streamFailed) { setState("error"); setContinue(true); }
       finishRun();
     }
   }
+}
+
+// A run can last minutes. The server names the conversation within seconds of the
+// first message, so poll just the title while streaming instead of leaving the
+// provisional name on screen until the whole run finishes.
+let titleWatch = null;
+let titleWatchBusy = false;
+let titleWatchDeadline = 0;
+
+function startTitleWatch(id) {
+  stopTitleWatch();
+  titleWatchDeadline = Date.now() + 20_000;
+  titleWatch = setInterval(async () => {
+    if (Date.now() > titleWatchDeadline) {
+      stopTitleWatch();
+      return;
+    }
+    if (titleWatchBusy) return;
+    titleWatchBusy = true;
+    try {
+      const meta = await api(`/conversations/${id}/meta`);
+      if (state.currentId !== id) return;
+      if (meta.title && $("sessionTitle").textContent !== meta.title) {
+        $("sessionTitle").textContent = meta.title;
+        const row = state.sessions.find((s) => s.id === id);
+        if (row) {
+          row.title = meta.title;
+          renderSessions();
+        } else {
+          await loadSessions();
+        }
+      }
+      if (["generated", "manual", "fallback"].includes(meta.title_source)) {
+        stopTitleWatch();
+      }
+    } catch (_) {
+      // A transient metadata failure must not end the run.
+    } finally {
+      titleWatchBusy = false;
+    }
+  }, 2000);
+}
+
+function stopTitleWatch() {
+  if (titleWatch) clearInterval(titleWatch);
+  titleWatch = null;
 }
 
 async function refreshSession(id) {
@@ -741,13 +811,18 @@ async function refreshSession(id) {
   await Promise.all([loadSessions(), refreshInspector(), loadUsage()]);
 }
 
+const RESUMABLE_STOPS = new Set([
+  "max_tokens", "max_iterations", "max_tool_calls", "loop_guard", "cancelled", "error",
+  "empty_response",
+]);
+
 function restoreStopState(messages) {
   const last = messages.at(-1);
   if (!last?.stop_reason) return;
   state.lastStop = last.stop_reason;
   $("readStop").textContent = last.stop_reason;
   $("readStop").classList.remove("muted");
-  setContinue(["max_tokens", "max_iterations", "loop_guard", "cancelled", "error"].includes(last.stop_reason));
+  setContinue(RESUMABLE_STOPS.has(last.stop_reason));
 }
 
 // --- composer ----------------------------------------------------------------
@@ -916,6 +991,7 @@ async function renderTask() {
 
 async function refreshInspector() {
   await renderTask();
+  await renderUncertainAttempts();
   const toolHost = $("toolList");
   if (state.toolsDirty || !state.toolCache) {
     showLoading(toolHost, "Reading registry…");
@@ -1018,6 +1094,51 @@ async function refreshInspector() {
     clearLoading(fileHost);
     $("downloadAllBtn").hidden = true;
     fileHost.innerHTML = '<p class="hint">Workspace unavailable.</p>';
+  }
+}
+
+async function renderUncertainAttempts() {
+  const section = $("uncertainSection"), host = $("uncertainList");
+  if (!section || !host) return;
+  host.replaceChildren();
+  section.hidden = true;
+  const id = state.currentId;
+  if (!id) return;
+  try {
+    const { attempts } = await api(`/conversations/${id}/attempts`);
+    if (state.currentId !== id) return;
+    section.hidden = !attempts.length;
+    for (const attempt of attempts) {
+      const item = document.createElement("div");
+      const title = document.createElement("p");
+      title.textContent = `${attempt.tool} · ${attempt.status}`;
+      const evidence = document.createElement("pre");
+      evidence.className = "entry-pre";
+      evidence.textContent = JSON.stringify(attempt.arguments, null, 2);
+      const label = document.createElement("label");
+      label.textContent = "Check the actual effect, then describe how you resolved it:";
+      const note = document.createElement("textarea");
+      note.maxLength = 2000;
+      note.setAttribute("aria-label", `Resolution for ${attempt.tool}`);
+      const button = document.createElement("button");
+      button.type = "button"; button.className = "btn btn-quiet";
+      button.textContent = "Record resolution"; button.disabled = true;
+      note.addEventListener("input", () => { button.disabled = !note.value.trim(); });
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await api(`/conversations/${id}/attempts/${attempt.id}/reconcile`, {
+            method: "POST", body: JSON.stringify({ note: note.value.trim() }),
+          });
+          await renderUncertainAttempts();
+          toast("Resolution recorded. You can deliberately retry if needed.");
+        } catch (error) { toast(error.message, "error"); button.disabled = false; }
+      });
+      label.appendChild(note); item.append(title, evidence, label, button); host.appendChild(item);
+    }
+  } catch (_) {
+    section.hidden = false;
+    host.textContent = "Outcome history unavailable. Refresh to retry.";
   }
 }
 

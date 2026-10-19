@@ -82,6 +82,7 @@ class Settings(BaseSettings):
 
     # Local data location
     toolloom_data_dir: Path | None = None
+    toolloom_db_busy_timeout_seconds: float = Field(default=1.0, ge=0.05, le=30)
 
     # Secrets vault key override
     toolloom_secrets_key: str | None = None
@@ -159,6 +160,16 @@ class Settings(BaseSettings):
                 f"TOOLLOOM_SEARCH_PROVIDER must be one of {sorted(VALID_SEARCH_PROVIDERS)}, "
                 f"got {self.toolloom_search_provider!r}"
             )
+        if self.model_context_window and self.model_max_output_tokens:
+            window = self.model_context_window
+            headroom = max(64, window // 20)
+            available = window - headroom - 512
+            if self.model_max_output_tokens > available:
+                raise ValueError(
+                    f"MODEL_MAX_OUTPUT_TOKENS={self.model_max_output_tokens} leaves fewer "
+                    f"than 512 input tokens in a {window}-token context window. Lower "
+                    "MODEL_MAX_OUTPUT_TOKENS or raise MODEL_CONTEXT_WINDOW."
+                )
 
     @property
     def provider_configured(self) -> bool:

@@ -11,6 +11,7 @@ from backend.services.conversation_service import title_from_message
 from backend.services.providers.base import ProviderMessage, TextBlock
 from backend.services.uploads import legacy_attachment_presentation
 from backend.utils import utcnow
+from backend.utils.async_work import run_blocking
 
 TITLE_PROMPT = (
     "Generate a short conversation title (2 to 6 words) describing the topic of the exchange. "
@@ -33,6 +34,48 @@ class ConversationTitles:
     async def generate(self, conversation_id: str, model_id: str | None = None) -> None:
         if not self.settings.toolloom_auto_titles:
             return
+        prepared = await run_blocking(self._prepare, conversation_id)
+        if prepared is None:
+            return
+        old_title, prompt = prepared
+
+        model = (
+            model_id or getattr(self.provider, "model_id", None) or self.settings.commandcode_model
+        )
+        title = ""
+        usage_in = usage_out = 0
+        error = None
+        try:
+            async with asyncio.timeout(TITLE_TIMEOUT_SECONDS):
+                budget = await self.catalogue.budget(model)
+                # Keep helper prompts within small model windows too.
+                prompt = prompt[: max(1, (budget.input_tokens - len(TITLE_PROMPT) // 4 - 64) * 3)]
+                turn = await self.provider.complete(
+                    messages=[ProviderMessage("user", [TextBlock(prompt)])],
+                    system=TITLE_PROMPT,
+                    tools=[],
+                    model_id=model,
+                    max_tokens=min(TITLE_MAX_OUTPUT_TOKENS, budget.max_output_tokens),
+                )
+                usage_in, usage_out = turn.usage.input_tokens, turn.usage.output_tokens
+                if turn.stop_reason == "end_turn" and not turn.tool_calls:
+                    title = " ".join(turn.text.strip().strip("\"'`").split())[:80]
+                    title = await run_blocking(self.redact, title)
+                if not title:
+                    error = (
+                        "output_limit" if turn.stop_reason == "max_tokens" else "invalid_response"
+                    )
+        except TimeoutError:
+            error = "timeout"
+        except Exception:
+            error = "provider_error"  # do not log response bodies or credentials
+        if error:
+            logger.info("AI title deferred (%s)", error)
+        await run_blocking(
+            self._store, conversation_id, old_title, title, error, usage_in, usage_out
+        )
+
+    def _prepare(self, conversation_id):
         with self.db.session() as session:
             conv = ConversationRepository(session).get(conversation_id)
             if conv is None or conv.title_source not in ELIGIBLE_SOURCES:
@@ -44,20 +87,11 @@ class ConversationTitles:
                 seconds=TITLE_RETRY_SECONDS
             ):
                 return
-            rows = MessageRepository(session).list_by_conversation(conversation_id)
-            user = next((row for row in rows if row.role == "user"), None)
-            answer = next(
-                (
-                    row
-                    for row in rows
-                    if row.role == "assistant" and row.content and row.stop_reason == "end_turn"
-                ),
-                None,
-            )
+            message_repo = MessageRepository(session)
+            user = message_repo.first_user(conversation_id)
+            answer = message_repo.first_assistant(conversation_id, end_turn_only=True)
             if answer is None:
-                answer = next(
-                    (row for row in rows if row.role == "assistant" and row.content), None
-                )
+                answer = message_repo.first_assistant(conversation_id)
             if user is None:
                 return
             text, files = legacy_attachment_presentation(user.content)
@@ -82,38 +116,9 @@ class ConversationTitles:
             if answer:
                 prompt += f"\nAssistant: {answer.content[:1000]}"
 
-        model = (
-            model_id or getattr(self.provider, "model_id", None) or self.settings.commandcode_model
-        )
-        title = ""
-        usage_in = usage_out = 0
-        error = None
-        try:
-            async with asyncio.timeout(TITLE_TIMEOUT_SECONDS):
-                budget = await self.catalogue.budget(model)
-                # Keep helper prompts within small model windows too.
-                prompt = prompt[: max(1, (budget.input_tokens - len(TITLE_PROMPT) // 4 - 64) * 3)]
-                turn = await self.provider.complete(
-                    messages=[ProviderMessage("user", [TextBlock(prompt)])],
-                    system=TITLE_PROMPT,
-                    tools=[],
-                    model_id=model,
-                    max_tokens=min(TITLE_MAX_OUTPUT_TOKENS, budget.max_output_tokens),
-                )
-                usage_in, usage_out = turn.usage.input_tokens, turn.usage.output_tokens
-                if turn.stop_reason == "end_turn" and not turn.tool_calls:
-                    title = " ".join(turn.text.strip().strip("\"'`").split())[:80]
-                    title = self.redact(title)
-                if not title:
-                    error = (
-                        "output_limit" if turn.stop_reason == "max_tokens" else "invalid_response"
-                    )
-        except TimeoutError:
-            error = "timeout"
-        except Exception:
-            error = "provider_error"  # do not log response bodies or credentials
-        if error:
-            logger.info("AI title deferred (%s)", error)
+        return old_title, prompt
+
+    def _store(self, conversation_id, old_title, title, error, usage_in, usage_out):
         with self.db.session() as session:
             conv = ConversationRepository(session).get(conversation_id)
             if conv is not None:

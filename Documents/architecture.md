@@ -1,682 +1,600 @@
 # ToolLoom architecture
 
-The [2026-10-18 code and architecture review](code-architecture-review-2026-10-18.md)
-records current verification and reproduced gaps in outcome tracking, approval,
-context anchors and task state. Read it alongside the mechanism descriptions here;
-the documented intent is stronger than the implementation in those failure paths.
+ToolLoom is a local-first, single-user agent runtime. The backend owns the agent
+loop, the browser is a thin REST/SSE client, and durable state lives in SQLite
+plus a per-conversation workspace. This document describes the current
+implementation: its components, contracts, request path and enforced boundaries.
+Where a mechanism has a limit, the limit is stated with it.
 
-This document explains what ToolLoom is, how a request travels through it, and
-why the main pieces are built the way they are. It describes the code in this
-repository as it stands. It is not a roadmap.
+## 1. Design principles
 
-Where a mechanism has a known limit, the limit is stated next to the mechanism
-rather than collected elsewhere, so no section here should be read as a guarantee
-the code does not make.
-
-## 1. What ToolLoom is
-
-ToolLoom is a single-user agent runtime that runs on your machine. The defining
-choice is that it implements the agent loop itself instead of wrapping someone
-else's agent framework or driving a CLI.
-
-That decision buys four things:
-
-- **The transcript is the product.** Every model turn, tool call, tool result,
-  stop reason and token count is persisted, so a conversation can be replayed
-  and audited.
-- **Providers are replaceable.** The loop speaks one normalized contract, so
-  swapping a model means writing an adapter, not touching the runtime.
-- **Tools are uniform.** An in-process helper and a remote MCP server are
-  discovered, validated and dispatched the same way.
-- **Storage and control stay local.** The server binds loopback and holds the
-  credentials. Configured inference sends context to Command Code; network and
-  executable tools require separate operator enablement.
-
-The frontend is deliberately thin. It renders state and forwards input. It never
-calls a model, never holds a key, and never decides what happens next.
-
-## 2. Design principles
-
-These are enforced by code, not by conventions:
-
-1. **The backend owns orchestration.** The browser is a REST and SSE client.
-2. **The provider contract is provider neutral.** OpenAI and Anthropic wire
-   formats exist only inside adapters. The runtime, storage and UI never see a
-   `choices` array or a `tool_use` content block from a vendor.
-3. **MCP is the tool contract.** Tools come from a registry, are namespaced
-   `server__tool`, and are dispatched through one executor.
-4. **Default deny.** A newly discovered server, tool or skill is disabled. A
-   high-risk tool also needs explicit approval, and the model can grant neither.
-5. **Truth lives in backend state.** Nothing claims a tool ran without a
-   persisted result. Missing results are recorded as missing.
+1. **The backend owns orchestration.** The browser renders state and forwards
+   input. It never calls a model, holds a credential, or decides the next step.
+2. **The model contract is provider-neutral.** Vendor wire formats exist only
+   inside adapters. The runtime, storage and UI see normalized text blocks,
+   tool-call blocks, usage and stop reasons.
+3. **MCP is the tool contract.** Every callable capability is a row in one
+   catalogue, namespaced `server__tool`, schema-validated at execution time and
+   dispatched through one executor.
+4. **Default deny.** New servers, tools and skills start disabled. High-risk
+   tools also need explicit approval, and the model can grant neither.
+5. **Truth lives in backend state.** Every model turn, tool dispatch, result,
+   stop reason and usage figure is persisted. A tool is never claimed to have run
+   without a recorded result.
 6. **Budgets are bounded and visible.** Iterations, tool calls, wall clock,
-   payload size and context have ceilings that surface as stop reasons.
-7. **Local first.** SQLite, the loopback bind, no mandatory container, no cloud
-   dependency, no telemetry.
+   output size and context have ceilings that surface as stop reasons or errors.
+7. **Local first.** SQLite, a loopback bind, no mandatory container, no cloud
+   dependency and no telemetry.
 
-## 3. Component map
+## 2. Component map
 
-Dependencies point one way: `api -> runtime/services -> repositories -> models`.
+Dependencies point one way: `api → runtime/services → repositories → models`.
 
 ```text
                     Browser (vanilla HTML/CSS/JS, served at /)
                                     |
-                        REST + SSE, same origin only
+                          REST + SSE, same origin
                                     v
-                    FastAPI  (backend/main.py, backend/api/*)
+                    FastAPI (backend/main.py, backend/api/*)
                                     |
              +----------------------+----------------------+
              v                                             v
    ConversationService                            AgentRuntime (runtime/)
-   (CRUD, message persistence)                    the agent loop
+   (CRUD, messages, files)                        the agent loop
              |                                             |
              |                        +--------------------+--------------------+
              |                        v                                         v
-             |                ContextBuilder / ContextCompactor          LLMProvider
-             |                (services/)                               (services/providers/)
+             |                ContextPolicy / ContextBuilder /         LLMProvider
+             |                ContextCompactor (services/)            (services/providers/)
              |                        |                                         |
-             |                SQLite transcript + workspace status     CommandCodeProvider
+             |                SQLite transcript + workspace             CommandCodeProvider
              |                        |                                 FakeProvider
-             |                        |                                 future adapters
              |                        v
              |                 ToolExecutor (services/)
              |                        |
              |                 ToolRegistry (services/)
              |                        |
              |                 MCPConnectionManager (services/)
-             |                   |            |            |          |
-             |                   v            v            v          v
-             |            local sandbox   generated   Streamable  legacy SSE  stdio
-             |            (in-process)  (in-process)     HTTP     (opt-in)    (opt-in)
+             |                   |          |          |          |
+             |                   v          v          v          v
+             |              local sandbox  generated  Streamable  legacy SSE  stdio
+             |              (in-process)  (in-process)   HTTP      (opt-in)   (opt-in)
              v
-     SQLite (SQLAlchemy 2)  +  per-conversation workspace files
+     SQLite (SQLAlchemy 2) + per-conversation workspace files
 ```
-
-Key modules:
 
 | Area | Module | Responsibility |
 | --- | --- | --- |
 | App | `backend/main.py` | App factory, lifespan, middleware, static mount |
-| Config | `backend/config.py` | Environment to typed settings, enum validation |
-| Storage | `backend/db.py` | Engine, session, SQLite pragmas, forward migrations |
-| HTTP | `backend/api/*` | Thin endpoints: conversations, MCP, skills, secrets, settings, usage |
-| Loop | `backend/runtime/agent_runtime.py` | The reasoning loop |
+| Config | `backend/config.py` | Environment to typed settings, validation |
+| Storage | `backend/db.py` | Engine, sessions, SQLite pragmas, forward migrations |
+| HTTP | `backend/api/*` | REST and SSE endpoints |
+| Loop | `backend/runtime/agent_runtime.py` | The reasoning loop and run record |
 | Guards | `backend/runtime/step_controller.py` | Duplicate, cascade and flood detection |
-| Output | `backend/runtime/observation.py` | Bounded tool output, spill references |
-| Context | `backend/services/context_builder.py` | Prompt assembly, repair, budget |
-| Context | `backend/services/context_compactor.py` | Summary of older turns through the provider |
-| Tools | `backend/services/tool_registry.py` | Server and tool catalogue, discovery, import and export |
+| Output | `backend/runtime/observation.py` | Bounded output and `ExecutionResult` |
+| Context | `backend/services/context_builder.py` | Prompt assembly, repair and fitting |
+| Context | `backend/services/context_policy.py` | Fit → prune → summarise → drop → refuse |
+| Context | `backend/services/context_compactor.py` | Rolling summary through the provider |
+| Tools | `backend/services/tool_registry.py` | Server/tool catalogue, discovery, import/export |
 | Tools | `backend/services/tool_executor.py` | Authorization, validation, dispatch, retry |
-| Tools | `backend/services/mcp_connection_manager.py` | Transport dispatch |
-| Tools | `backend/services/mcp_client.py` | MCP SDK wrapper for HTTP, SSE and stdio |
-| Sandbox | `backend/services/sandbox/*` | In-process tools, shared subprocess policy, workspace rules |
-| Foundry | `backend/services/tool_foundry/*` | Capability manifests, validation, install store, execution |
-| Providers | `backend/services/providers/*` | Normalized contract plus adapters |
-| Secrets | `backend/services/secrets.py` | Fernet vault and `${secrets.NAME}` substitution |
+| Tools | `backend/services/mcp_connection_manager.py` | Transport dispatch and session ownership |
+| Tools | `backend/services/mcp_client.py` | MCP SDK wrapper |
+| Sandbox | `backend/services/sandbox/*` | In-process tools, subprocess policy, workspace rules |
+| Foundry | `backend/services/tool_foundry/*` | Manifests, authoring, validation, install store, runner |
+| Providers | `backend/services/providers/*` | Normalized contract, Command Code adapter, fake provider |
+| Skills | `backend/services/skills/*`, `skill_service.py` | Discovery, validation, installation |
+| Secrets | `backend/services/secrets.py`, `secret_service.py` | Fernet vault and `${secrets.NAME}` resolution |
+| Async | `backend/utils/async_work.py` | Short blocking work kept off the event loop |
 
-## 4. The request path
+## 3. Request path
 
-A single streamed turn, from click to first token:
+A streamed turn:
 
 ```text
 POST /conversations/{id}/messages/stream
   |
-  +-- validate Origin and Host
-  +-- reserve the conversation (409 if a run is active, 429 if 16 are running)
-  +-- persist the user message, auto-title if the conversation is untitled
+  +-- middleware: Host check; Origin check for state-changing requests
+  +-- reserve the conversation (409 if active; 429 if 16 runs are active)
+  +-- persist the user message; schedule a title update
   +-- return text/event-stream
         |
         v
    AgentRuntime.run_stream(conversation_id)
-        |
-        +-- compaction check (may emit compacting / compacted)
-        +-- resume hint when the previous turn ended at a cliff
-        |
-        +-- for each iteration, up to the budget:
-        |     ContextBuilder.build()      history + tools + skills + prompt
-        |     provider.stream()           normalized deltas and tool calls
+        +-- resolve the task and start a Run record
+        +-- resume advisory when the previous turn was interrupted
+        +-- for each iteration, within budget:
+        |     render pinned task/plan and execution state
+        |     ContextPolicy.prepare()       fit / prune / summarise / drop
+        |     provider.stream()             normalized deltas and tool calls
         |     persist the assistant turn
-        |     if stop_reason == tool_use:
-        |         ToolExecutor.execute() per call
-        |         persist one tool result per call id
-        |     else break
-        |
-        +-- emit done with reply, iterations, stop reason, usage, tool trace
+        |     execute requested tools and persist one result per call id
+        |     update progress and loop-guard state
+        +-- emit done (reply, iterations, stop reason, usage, tool trace)
 ```
 
-The endpoint owns its own database session for the lifetime of the SSE
-generator. A request-scoped session would close when the response headers are
-sent, which is before the first event.
+The SSE endpoint owns its own database sessions for the life of the generator; a
+request-scoped session would close when the response headers are sent. Title
+generation runs as a bounded background task and never holds the run open. The
+conversation has a lightweight `/meta` endpoint so the client can poll the title
+without fetching the transcript.
 
-## 5. The agent loop
+## 4. Agent loop
 
-`AgentRuntime.run_stream` yields `AgentEvent` objects that map one to one onto
-SSE frames:
+`AgentRuntime.run_stream` yields `AgentEvent` objects that map to SSE frames:
 
 | Event | Payload | When |
 | --- | --- | --- |
-| `compacting` | `{}` | Before the compaction check |
-| `compacted` | `{}` | Only if a summary was actually written |
-| `iteration_start` | `iteration` | Start of each model turn |
-| `token` | `text` | Each streamed text delta |
-| `tool_call_start` | tool call id, name | The model requested a tool |
-| `tool_call_validated` | errors | Schema validation rejected the arguments before dispatch |
-| `tool_call_retry` | attempt, reason | A safe pre-send failure is being retried |
-| `tool_call_end` | input, output, error flag, attempts, duration | After the tool ran |
+| `compacting` | `{}` | A compaction check is starting |
+| `compacted` | `{reduction}` | History was actually reduced |
+| `iteration_start` | `iteration` | Start of a model turn |
+| `token` | `{text}` | A streamed text delta |
+| `tool_call_start` | call id, name | The model requested a tool |
+| `tool_call_validated` | tool, errors | Schema validation rejected arguments |
+| `tool_call_retry` | attempt, reason | A safe pre-send retry is happening |
+| `tool_call_end` | input, output, flags, duration | A call settled |
 | `step_note` | level, message, context | A loop guard fired |
-| `usage` | input, output, total tokens | End of a model turn |
-| `done` | reply, iterations, stop reason, usage, tool trace | Turn finished |
-| `error` | message | The run failed |
+| `usage` | input, output, total | End of a model turn |
+| `done` | reply, iterations, stop reason, usage, trace | Run completed |
+| `error` | message | Run failed |
 
-Normalized stop reasons are `end_turn`, `tool_use`, `max_tokens`,
-`stop_sequence`, `max_iterations`, `cancelled` and `error`. A truncated response
-is never reported as a clean finish: `length` becomes `max_tokens`, and a stream
-that ends without a finish reason becomes `error`.
+Provider-normalized stop reasons are `end_turn`, `tool_use`, `max_tokens`,
+`stop_sequence`, `max_iterations`, `max_tool_calls`, `loop_guard`, `cancelled`
+and `error`. Run outcomes are `completed`, `failed`, `interrupted` and
+`cancelled`; an empty completed turn is recorded as `empty_response` rather than
+as a successful empty answer.
 
-Ceilings: `TOOLLOOM_MAX_ITERATIONS` (12), `TOOLLOOM_MAX_TOOL_CALLS` (40),
-`TOOLLOOM_RUN_TIMEOUT_SECONDS` (300) and `TOOLLOOM_MAX_OUTPUT_CONTINUATIONS` (3).
-Without that last one, a reply the provider cut off at the output limit ends the run
-and the operator has to click Continue; with it, the run finishes the answer, and any
-tool call from a truncated turn is refused rather than executed with partial
-arguments. The **Unlimited steps** switch removes the two count caps for later runs,
-and leaves the guards, timeouts, context limits and approvals in place.
+Default limits:
 
-`StepController` is deterministic and does no I/O. It flags three identical calls
-with the same arguments, refuses a tool after three consecutive failures in one
-turn, and notes a flood of six calls with no user-facing text. Its advice is
-injected into the next iteration and is not persisted. It cannot grant access to
-anything.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `TOOLLOOM_MAX_ITERATIONS` | 100 | Model turns per run |
+| `TOOLLOOM_MAX_TOOL_CALLS` | 300 | Tool calls per run |
+| `TOOLLOOM_RUN_TIMEOUT_SECONDS` | 1800 | Wall-clock deadline for a run |
+| `TOOLLOOM_MAX_OUTPUT_CONTINUATIONS` | 3 | Automatic continuations of a truncated reply |
+| `TOOLLOOM_MAX_OUTPUT_TOKENS` | auto | Per-turn output cap |
+| `MODEL_CONTEXT_WINDOW` | auto | Optional local context ceiling |
 
-## 6. Provider contract
+The **Unlimited steps** setting removes the iteration and tool-call caps for later
+runs. Timeouts, context limits, approvals and loop guards remain. A provider turn
+stopped at the output limit is continued automatically; any tool call from that
+truncated turn is refused rather than executed with partial arguments.
+
+`StepController` is deterministic and does no I/O. It warns on the third
+identical call, refuses a call after five identical calls without progress, warns
+after three consecutive failures with the same arguments, and notes six tool calls
+without a user-facing answer. Progress is measured from the workspace revision
+before and after a call, so a shell edit followed by the same verification command
+is not mistaken for a loop. Guard advice is injected into the next prompt and is
+not persisted.
+
+Blocking database, filesystem and context work runs through `run_blocking`, which
+keeps those operations off the event loop and does not abandon an in-flight
+transaction on request cancellation. A terminal outcome is committed before
+`done` or `error` is yielded; closing the generator afterwards does not rewrite a
+completed run as interrupted.
+
+## 5. Provider contract
 
 `backend/services/providers/base.py` defines the only shapes the runtime knows:
 
-- `TextBlock`, `ToolCallBlock`, `ToolResultBlock` and `ProviderMessage`
+- `TextBlock`, `ToolCallBlock`, `ToolResultBlock`, `ProviderMessage`
 - `ToolSpec` for advertised tools
-- `ModelTurn` with ordered blocks, `stop_reason`, `Usage`, `model_id` and metadata
+- `ModelTurn` with ordered blocks, `stop_reason`, `Usage`, `model_id`, metadata
 - Stream events: `TextDelta`, `ToolCallStartEvent`, `ToolCallDeltaEvent`,
   `UsageEvent`, `MessageStopEvent`
-- `BaseProvider.stream()` for the wire, plus a `complete()` helper that drains it
+- `BaseProvider.stream()` plus `complete()`, which drains a stream
 
-`CommandCodeProvider` implements the documented endpoints. The OpenAI-compatible
-path accumulates `delta.tool_calls[*]` by index because ids, names and argument
-fragments arrive in separate chunks, and parses the JSON only once the call is
-complete. The Anthropic-compatible path normalizes `tool_use`, `tool_result`,
-text blocks, stop reasons and usage into the same contract. Style is chosen by
-`COMMANDCODE_API_STYLE`, with `auto` routing Claude models to `/messages`.
+`CommandCodeProvider` implements the documented endpoints:
 
-Provider retries are bounded and apply to connection failures and HTTP
-502/503/504 responses before streaming begins. An HTTP error does not prove that
-upstream inference did no work, so this is not a no-double-charge guarantee.
-Interrupted streaming is surfaced rather than silently restarted. Tool dispatch
-has its own narrower retry policy.
+- OpenAI-compatible `/chat/completions`, accumulating fragmented
+  `tool_calls[*]` arguments by index and parsing only when complete.
+- Anthropic-compatible `/messages`, normalizing `tool_use`, `tool_result`, text,
+  stop reasons and usage into the same contract.
+- `COMMANDCODE_API_STYLE` selects the style; `auto` routes Claude models to
+  `/messages`.
+- SSE error frames and JSON error objects become typed, redacted `ProviderError`
+  values. A pre-response 429/502/503/504 is retried once with a bounded
+  `Retry-After` wait; partially streamed requests are never replayed.
+- Provider function names are translated to valid wire names where a canonical
+  MCP identity is too long or contains punctuation, with a reversible mapping.
 
 `FakeProvider` implements the same contract deterministically. It supports
-scripted turns, which is how the tool-use, interruption and resume tests drive
-multi-step flows without a network or a key.
+scripted turns, which is how the offline suite drives multi-step tool use,
+interruption and resume without a network or a key.
 
-## 7. Tool execution
+## 6. Tool execution
 
 `ToolExecutor` is the only path from a model tool call to a result:
 
-1. Split the namespaced name on the first `__`. A server name may not contain
-   `__`, so a call routes to exactly one server.
-2. Look up the server and confirm `enabled`.
-3. Look up the tool and confirm `enabled`.
-4. For `risk: high`, confirm `approved`.
-5. Validate arguments against the stored JSON schema again. Not in the prompt,
-   not once at discovery: here, before dispatch.
-6. Dispatch through `MCPConnectionManager`.
-7. Return an `ExecutionResult` for every failure mode.
+1. Resolve the requested name once to a canonical `server__tool` identity. A bare
+   name maps to its namespaced form only when exactly one enabled tool matches;
+   ambiguity is refused.
+2. Split the server and tool names on the first `__`.
+3. Confirm the server and tool are enabled; a high-risk tool must also be
+   approved.
+4. Validate the arguments against the stored JSON schema again, immediately
+   before dispatch.
+5. Dispatch through `MCPConnectionManager`.
+6. Return an `ExecutionResult` for every failure mode.
 
-Every failure becomes a structured error result rather than an exception, so the
-model can read what went wrong and the transcript records it. Retry is limited to
-pre-send transport failures (`ConnectError`, `ConnectTimeout`, `PoolTimeout`,
-unwrapped from anyio exception groups), because those are the ones that cannot
-have reached the server.
+Execution outcomes keep separate facts:
 
-Output handling: results over 40,000 characters are shown to the model as a
-bounded head-and-tail view, and the full text is written to
-`<workspace>/.transcripts/<tool-call-id>.txt` with a path the model can page or
-grep. The complete text still reaches the UI. Nothing is quietly dropped.
+- `is_error` — the call could not be executed, was refused, or was interrupted.
+- `exit_code` — what a process returned when it ran.
+- `verification_failed` — a process ran and exited non-zero.
+- `outcome_uncertain` — the effect may have landed but could not be proven.
+- `validation_errors` — schema failures, surfaced before dispatch.
 
-## 8. MCP integration
+Retries are limited to a verified pre-send transport failure and only for a
+read-only tool. The transport reports a stage (`pre_send`, `dispatch`, `cleanup`);
+only `pre_send` proves the request never reached the server. A cleanup error
+after a received result does not discard that result. A local preflight failure
+(`ToolPreflightError`) is a known non-effect, so a corrected retry is allowed.
 
-Five transports, one capability model:
+Tool output over the model-facing budget is shown as a bounded head-and-tail view;
+the full text is written to `<workspace>/.transcripts/<tool-call-id>.txt` with a
+path the model can page or grep. Known provider and vault secrets are redacted
+before output is persisted or spilled.
+
+Effect classification is operator-controlled: `read_only`, `idempotent`,
+`mutating` or `unknown` (the default). It drives retry safety and mutation
+serialization. A server's own claim that a tool is read-only is not treated as a
+guarantee.
+
+## 7. MCP integration
+
+Five transports share one capability model:
 
 | Transport | Path | Notes |
 | --- | --- | --- |
-| `local` | In-process | The built-in sandbox. Cannot be created or edited by an operator, or by the model |
-| `generated` | In-process | Installed Tool Foundry capabilities. Also runtime-owned |
+| `local` | In-process | The built-in sandbox. Runtime-owned |
+| `generated` | In-process | Installed Tool Foundry capabilities. Runtime-owned |
 | `http` | Streamable HTTP | Default for remote servers |
-| `sse` | Legacy HTTP+SSE | Kept for servers that only offer it |
-| `stdio` | Fixed local command | Operator-only, requires `TOOLLOOM_ALLOW_STDIO=1` |
+| `sse` | Legacy HTTP+SSE | For servers that only offer it |
+| `stdio` | Fixed local command | Operator-only; needs `TOOLLOOM_ALLOW_STDIO=1` |
 
-`local` and `generated` are in-process adapters rather than MCP sessions. Discovery
-reads a Python dict, or the installed manifests, instead of making a `tools/list`
-round trip; dispatch calls the handler directly instead of `tools/call`. There is
-no JSON-RPC, no `initialize` handshake and no session for either. They are
-registered as servers anyway, because that is what gives them the same catalogue,
-schema validation, enable flag, risk level and approval gate as a remote server —
-one model to reason about, one executor to audit.
+`local` and `generated` read a Python catalogue or installed manifests instead
+of making a `tools/list` call, and invoke a handler directly instead of
+`tools/call`. They are still registered as servers so they obtain the same
+catalogue, schema validation, enable flag, risk level and approval gate.
 
-Servers are stored in SQLite, not in a watched file. You paste a config in
-Settings, or import one, and ToolLoom reconciles it:
+Remote servers are stored in SQLite and reconciled from the Settings import:
 
-- Imports are all-or-nothing. One invalid entry leaves every connection as it was.
+- Imports are all-or-nothing; one invalid entry leaves every connection unchanged.
 - New and changed connections arrive disabled.
-- A schema change revokes the previous approval for that tool.
-- Discovery adds, updates and removes tool rows, and always preserves the enable
-  flag on rows that already exist.
-- Sync removal deletes omitted custom servers, never in-process ones (`local` and
-  `generated` are both exempt).
+- A schema change revokes prior approval for that tool.
+- Discovery adds, updates and removes tool rows while preserving the enable flag
+  on existing rows.
+- Sync removal deletes omitted custom servers; runtime-owned servers are exempt.
 - Exports mask literal headers, environment values and credential-bearing query
-  strings as `<stored; unchanged>`, which round-trips safely in this installation
-  and is deliberately not portable to another one.
+  strings. The masked values round-trip only on the same installation.
 
-## 9. The built-in sandbox
+stdio sessions are owned by a dedicated actor task because the MCP SDK context
+is bound to the task that entered it. Sessions are reused across calls, with one
+absolute deadline covering acquisition, initialization, queue wait and dispatch;
+cleanup has its own bounded wait. Configuration changes invalidate superseded
+sessions, including when the registry mutation runs on a worker thread.
+HTTP and SSE sessions remain per-call.
 
-One in-process server named `sandbox`. It is always present, cannot be removed,
-and every one of its tools starts disabled.
+## 8. Built-in sandbox
 
-| Tool | Risk | What it does |
+The `sandbox` server is always present and cannot be removed. Every tool starts
+disabled.
+
+| Tool | Risk | Purpose |
 | --- | --- | --- |
 | `fs_read`, `fs_write`, `fs_list`, `fs_grep`, `fs_delete` | low | Workspace file access |
-| `http_fetch` | high | Fetch a public URL, with SSRF controls |
-| `web_search` | high | Keyless search: DuckDuckGo, Wikipedia, or your own SearXNG |
-| `python` | high | Run Python in the workspace. Not OS-isolated |
-| `shell` | high | Run a shell command. Not OS-isolated. The verification primitive |
-| `skill_list`, `skill_read` | low | Read installed skills |
+| `plan_read`, `plan_write` | low | Durable task objective and plan |
+| `http_fetch` | high | Public HTTP(S) fetch with SSRF controls |
+| `web_search` | high | Keyless search: DuckDuckGo, Wikipedia or SearXNG |
+| `python` | high | Python subprocess, opt-in |
+| `shell` | high | Shell command, opt-in; the verification primitive |
+| `skill_list`, `skill_read` | low | Read enabled skills |
 | `foundry_scaffold` | low | Write a capability package skeleton |
 | `foundry_validate`, `foundry_install` | high | Run generated tests, then install |
 
-**Workspace path rules.** Every path resolves through `Workspace.resolve`, which
-rejects absolute paths, drive letters, UNC paths, `~`, NUL bytes, and anything
-that escapes the root after `Path.resolve()`. A symlink planted by the model
-cannot reach outside. Scratch directories (`.transcripts`, `.vendor`, `.cache`,
-`.tmp`) are hidden from listings and downloads.
+**Workspace paths.** Every path resolves through `Workspace.resolve`, which
+rejects absolute paths, drive letters, UNC paths, `~`, NUL bytes and anything
+that escapes the root after symlink resolution. Paths under the runtime namespace
+(`.toolloom/`) and scratch directories (`.transcripts`, `.vendor`, `.cache`,
+`.tmp`) are hidden from listings and downloads. Workspace traversal prunes
+dependency and build trees such as `node_modules`, `.venv`, `.git`, `dist` and
+`build`.
 
-**`http_fetch` controls.** Only `http` and `https`. The hostname is resolved and
-every address must be public, so loopback, private, link-local, multicast and
-reserved ranges are refused. Literal `Authorization`, `Cookie`, `Host` and
-`Proxy-Authorization` headers are rejected unless the whole value is one
-`${secrets.NAME}` reference. The body is capped while streaming, redirects are
-re-validated per hop and credentials are stripped when a redirect crosses origin.
+**`http_fetch`.** Only `http`/`https`; the hostname is resolved and every address
+must be public, so loopback, private, link-local, multicast and reserved ranges
+are refused. Credential-bearing literal headers are rejected unless the whole
+value is one `${secrets.NAME}` reference. The body is capped while streaming,
+redirects are re-validated per hop, and credentials are stripped across origins.
 
-**`web_search` controls.** No provider needs a key. The tool sends the query and
-nothing else: headers are fixed by the tool, nothing is read from the vault, and
-no cookies are kept. Markup parsing lives in three pure functions pinned by
-fixture tests, so a provider changing its HTML fails loudly in the suite instead
-of silently returning nothing.
+**`web_search`.** No provider needs an account or API key. Only the query is sent;
+headers are fixed by the tool, the vault is not read, and cookies are not kept.
+DuckDuckGo's HTML endpoint is undocumented and may change; Wikipedia is the
+stable fallback and SearXNG uses an operator-supplied instance.
 
-**`python` controls.** Off by default. Runs `sys.executable` with the workspace
-as the working directory and a minimal environment. 15-second default timeout and
-a 64,000-byte combined output cap, both configurable.
+**`python` and `shell`.** Both are off by default and require the environment
+flag, the tool enable flag and (because they are high risk) approval. They run as
+the operator and are **not OS-isolated**. `python` uses the backend interpreter
+with a conversation workspace cwd and a minimal environment. `shell` uses `bash`
+when available (with `pipefail`) and otherwise `sh`; it never falls back to
+`cmd`. Its `cwd` may point outside the workspace because the command could `cd`
+there anyway; the argument is not presented as a boundary.
 
-**`shell` controls.** Off by default, and the reason the agent can check its own
-work: run the test suite, read the failure, fix it. Without a primitive like this
-an agent can write a project but never establish that it runs, which makes "done"
-unfalsifiable.
+**Subprocess policy.** `sandbox/_exec.py` is shared by Python, shell and Tool
+Foundry: argv arrays only, a minimal environment, a hard wall-clock timeout, a
+combined output cap enforced while reading, stdout/stderr retaining independent
+head and tail views, and process-tree termination on expiry. On Linux, a fixed
+process guardian uses `PR_SET_CHILD_SUBREAPER` to keep descendants attached to a
+verifiable owner. Spawned jobs are recorded by PID and kernel start time; startup
+recovery kills a recorded group only when the identity still matches. Other
+platforms use normal timeout and cancellation behavior.
 
-It is a real shell (`bash`, else `sh`), so pipes, `&&` and substitution behave as
-the operator expects. `find_posix_shell` returns `None` when neither exists, and
-the tool is then neither advertised nor runnable rather than silently falling back
-to `cmd`, whose semantics would change what a command means. Arguments are
-validated before dispatch, the command length is bounded, `cwd` defaults to the
-conversation workspace, and wall clock and combined output follow the same
-`_exec` policy as `python` — including killing the whole process tree on expiry.
+**Mutation ownership.** Local mutating tools run in a worker thread under a
+per-workspace lease. The lease is owned by a task that waits for the actual
+thread, so a cancelled request cannot release it mid-write and an older writer
+cannot publish over a newer one. A queued operation cancelled before it starts is
+removed rather than run later.
 
-The child gets `minimal_env` rather than the operator's environment, so provider
-keys and vault material cannot leak into a command, with `HOME` added because real
-toolchains need it for caches and configuration. `cwd` may point outside the
-workspace: the command could `cd` there anyway, so confining the argument would
-be a false guarantee rather than a boundary. The tool is therefore documented the
-same way `python` is — bounded, not contained — and is gated four times over:
-`TOOLLOOM_ALLOW_SHELL`, the enable flag, the approval requirement, and removal
-from the prompt when the flag is off.
+## 9. Tool Foundry
 
-## 10. Tool Foundry
+Tool Foundry turns a reusable script into an installed capability.
 
-Turns a script the operator keeps rewriting into an installed capability that any
-later conversation can call. The agent never starts this on its own; it runs when
-asked. Stage 4 of the original plan — the agent noticing a repetition and
-*proposing* a capability — is deliberately not built, because there is no evidence
-yet that suggestions would be welcome.
+1. **Scaffold** — `foundry_scaffold` writes
+   `<workspace>/foundry/<name>/` with `manifest.json`, a CLI skeleton whose flags
+   match the declared schema, and a unittest file. Existing files are not
+   overwritten.
+2. **Validate** — `foundry_validate` checks the manifest, confirms the entrypoint
+   and tests stay inside the package, and runs `python -m unittest discover`.
+   Zero discovered tests is a failure, as is any non-zero exit.
+3. **Install** — `foundry_install` validates again, copies the package to
+   `<data_dir>/tools/<name>/<version>/`, records the entrypoint hash, a digest over
+   every package file, the install time, source conversation and test count, and
+   registers `generated__<name>` disabled and unapproved.
 
-### 10.1 Three steps, kept separate
+Approval is bound to the package **digest**, not the interface. Every file is
+covered: entrypoint, helpers, resources and manifest. Reinstalling changed code
+revokes approval and disables the tool; a changed installed file refuses to run;
+a symlink inside a package fails the digest instead of being followed.
 
-1. **`foundry_scaffold`** writes `<workspace>/foundry/<name>/` containing
-   `manifest.json`, a CLI skeleton whose `argparse` flags are generated from the
-   declared schema (underscores become hyphens), and a unittest file. Existing
-   files are never overwritten, so calling it twice is safe.
-2. **`foundry_validate`** checks the manifest, that the entrypoint stays inside the
-   package, and that the tests path exists, then runs the suite with
-   `python -m unittest discover`. The standard library runner is a deliberate
-   choice: pytest is a development dependency here, and a capability has to
-   validate on any installation. Zero discovered tests is a failure, as is any
-   non-zero exit code, so an empty suite cannot pass.
-3. **`foundry_install`** validates again, copies the package to
-   `<data_dir>/tools/<name>/<version>/`, records the entrypoint's SHA-256,
-   `installed_at`, the originating conversation and the test count in
-   `.integrity.json`, and registers the tool on the `generated` server disabled and
-   unapproved.
+New scaffolds use `argument_encoding: "json"`, an exact JSON envelope that
+preserves empty arrays, booleans, objects, nulls and strings beginning with a
+hyphen. Installed packages that declare `flags` keep their legacy CLI contract.
+The runtime maps schema properties onto either form; it does not interpret the
+manifest's `permissions` block, which records what a tool claims to need.
 
-### 10.2 Why installed packages leave the workspace
+`GET /capabilities` lists installed packages with version, permissions, test
+evidence, provenance and current enable/approval state.
+`GET /capabilities/{name}/source` returns the source for review, and
+`DELETE /capabilities/{name}` removes the package and re-syncs the catalogue.
+Enablement and approval use the same tool endpoints as every other tool.
 
-Installation copies the package to `<data_dir>/tools/`, outside the
-workspace-scoped filesystem API. This is not an OS boundary: opted-in Python and
-generated code run as the same user, can read that directory, and can rewrite it
-along with the records below. One version per name is active, and the new version
-is published before the superseded one is retired, so an interrupted install
-cannot lose the tool.
+The feature is gated by `TOOLLOOM_ALLOW_FOUNDRY=1`. Validation executes generated
+code, installation needs approval, and an installed capability runs as the
+operator with no OS isolation.
 
-Approval is bound to the package **digest**, not to the tool's interface. Every
-file is covered — entrypoint, helper modules, resources and the manifest — because
-any of them can change what a package does. Consequences worth stating plainly:
-reinstalling a package whose files changed revokes its approval and disables it,
-so an unchanged schema can never re-authorise new code; a change to any file makes
-it refuse to run; and a symlink inside a package fails the digest rather than being
-followed out of it.
+## 10. Skills and secrets
 
-### 10.3 The manifest is a proposal, not an enforcement layer
+**Skills.** A directory containing `SKILL.md` is a skill. Frontmatter supplies the
+name, description, auto-include and hidden-from-model flags. Skills install from a
+zip or a Markdown file; archives are validated before extraction (no absolute
+paths, `..`, backslashes or symlink entries; bounded expansion). New skills start
+disabled. Enabled skills appear in the model's prompt and can be read with
+`skill_list` / `skill_read`. Inlined bodies have `</` neutralized so a skill
+cannot close its own tags.
 
-`permissions.filesystem` and `permissions.network` record what the tool claims to
-need, and the Capabilities view shows them for review. The runtime does not act on
-them. An installed capability is a child process running as the operator with no
-OS-level isolation, so a script that ignores `network: false` still reaches the
-network. The fields are labelled as claims everywhere they appear rather than
-presented as a guarantee the runtime cannot keep.
+**Secrets.** Values are encrypted at rest with Fernet; the key lives in a
+git-ignored file with private permissions or in `TOOLLOOM_SECRETS_KEY`. The API
+returns masked previews and never the value. `${secrets.NAME}` references in MCP
+headers or environment values resolve server-side. Vault contents are never sent
+to the model.
 
-### 10.4 Execution
+## 11. Durable execution and recovery
 
-`generated` dispatches in `MCPConnectionManager` beside the other transports.
-`ToolExecutor` has already validated the arguments against the stored schema, so the
-runner only maps them onto flags:
+Four identities are distinct:
 
-- `--name value`, with underscores written as hyphens.
-- Booleans become a bare `--flag` when true and are omitted when false.
-- Arrays repeat the flag; objects are JSON-encoded.
-- Properties are emitted in sorted order, so one call always produces one argv.
+- **Conversation** — what was said (`messages`).
+- **Task** — what is being accomplished: immutable `original_request`, versioned
+  `objective` and `plan`, completion criteria, and active/completed status.
+- **Run** — one attempt: status, stop reason, iteration and tool-call counts.
+- **Tool attempt** — one dispatch: canonical tool name, argument digest and JSON,
+  effect classification, status and result digest.
 
-The child runs with the **conversation workspace as its working directory**, which
-is what makes `--input security-events.jsonl` meaningful from a conversation, and
-with the shared policy in `sandbox/_exec.py`: argv arrays only, a minimal
-environment, a wall-clock timeout, a combined output cap enforced while reading,
-and a process-tree kill on expiry. Before each run the entrypoint is re-hashed
-against the recorded value; a mismatch refuses the call instead of running it. The
-same policy module backs `python`, so there is one place where subprocess rules
-live.
+An attempt is written before dispatch (`pending` → `running`) and settled when
+the result is persisted. Settlement and the tool-result transcript row commit in
+one transaction, so a crash between them cannot leave a settled attempt with no
+recorded result.
 
-### 10.5 Gates
+On startup:
 
-`TOOLLOOM_ALLOW_FOUNDRY` (default `0`) gates all three authoring tools, because
-validation executes generated code. The tools also obey default-deny: `foundry_
-scaffold` starts disabled, and the two that run generated code additionally
-require approval. Installed capabilities are `risk: high` for the same reason. An
-operator who never sets the flag can never install anything, which is the property
-that makes it safe to let the agent write a capability on request at all.
+- A run left `running` becomes `interrupted`.
+- An attempt left `pending` or `running` becomes `unknown`.
+- Recorded Linux child jobs are terminated when their kernel identity still
+  matches.
 
-### 10.6 Capabilities view and API
+A resume receives the previous run's status, completed mutations and uncertain
+outcomes, so it continues from evidence. Repeating an identical call whose outcome
+is `unknown` is refused unless the tool is `read_only`; the operator resolves it
+through `POST /conversations/{id}/attempts/{attempt_id}/reconcile`, optionally
+with a note. Reconciliation is refused while the conversation has an active run or
+a local writer is still finishing. The runtime cannot know whether an unknown side
+effect landed.
 
-`GET /capabilities` returns each installed package with its version, declared
-permissions, install test count, provenance and current enable/approval state, so
-the view can show what was approved rather than recomputing it.
-`GET /capabilities/{name}/source` returns the CLI and its tests for review.
-`DELETE /capabilities/{name}` removes the installed package and re-syncs the
-catalogue. Enable and approval are not reimplemented: they go through
-`PATCH /mcp/servers/{id}/tools/{name}` like any other tool.
+Task state is authoritative in SQLite. The pinned prompt view carries the current
+objective and plan; `.toolloom/plan.md` and `.toolloom/request.md` are runtime
+projections, not a second source of truth. Completing a task ends its authority
+over later runs.
 
-### 10.7 What this deliberately does not do
+## 12. Context management
 
-No skill generation, and no automatic capability creation. The `description` in the
-manifest carries the "when to use this" guidance the model needs, which covers the
-discovery problem Stage 3 was meant to solve without adding a second artifact to
-keep in sync.
+`ModelCatalogue` resolves the selected model's context window and output
+allowance. When `MODEL_MAX_OUTPUT_TOKENS` is blank, output is derived from the
+window (half, capped at 32,768) and the remaining budget is reserved for the
+prompt, with estimation headroom and a minimum input allowance. An explicit
+output setting is a cap, never an entitlement to consume the whole window.
 
-## 11. Data model
+`ContextPolicy` runs on every iteration and reduces history in cost order:
 
-SQLite through SQLAlchemy 2, with `foreign_keys=ON`, `journal_mode=WAL`,
-`synchronous=NORMAL` and a 30-second busy timeout. WAL matters here because
-parallel tool work reads the catalogue while the runtime writes the transcript.
+1. **Fit.** If the prompt fits, nothing changes. The provider's own
+   `usage.input_tokens` for the previous prompt anchors the prefix; appended
+   messages are estimated.
+2. **Prune tool results.** Old results become a head, a size note and a tail.
+   Deterministic and free; assistant `tool_use` blocks remain intact.
+3. **Summarise.** `ContextCompactor` uses the selected provider and keeps a recent
+   verbatim suffix. A summary is accepted only on a completed turn and within its
+   output contract; it advances the cursor only over complete exchanges.
+4. **Drop oldest exchanges.** A unit is an assistant turn plus the results
+   answering it. The newest exchange is never dropped. The fit decision includes
+   any continuation notice, so the opening is not pushed over budget after the
+   decision.
+5. **Refuse.** If the system prompt, tool schemas and newest exchange alone exceed
+   the window, the run fails with a clear `ContextBudgetError`.
+
+The builder reads only the active suffix after the summary cursor, in bounded
+chunks. Omitted unsummarized rows are reported and make the run summarise or state
+the loss rather than silently pretending it saw everything. A single oversized
+completed exchange is preserved in full as a `.transcripts/exchange-<digest>.json`
+artifact and rendered as an explicit historical excerpt.
+
+The pinned task view is a bounded rendering: objective, active/next steps, compact
+completed evidence and a reference to the full plan. The durable task record is
+never trimmed. `repair_orphan_tool_uses` supplies an explicit missing-result block
+for an unpaired call; it never fabricates a successful result. Token counts are
+character-based estimates, not exact model tokenization.
+
+## 13. Data model
+
+SQLite via SQLAlchemy 2, with `foreign_keys=ON`, `journal_mode=WAL`,
+`synchronous=NORMAL` and a configurable busy timeout (1 second by default).
+WAL allows reads while the runtime writes the transcript.
 
 | Table | Holds |
 | --- | --- |
-| `conversations` | Title, rolling summary, summary message count, timestamps |
-| `messages` | Role, text, provider-neutral blocks as JSON, tool name, tool call id, stop reason, usage, resume flag |
-| `mcp_servers` | Transport, URL, command and args, headers, enable and trust flags, timeouts |
-| `tools` | Namespaced name, description, input schema, enable flag, risk, approval |
-| `skills` | Name, description, on-disk path, enable and auto-include flags |
+| `conversations` | Title and title provenance, rolling summary and cursor, timestamps |
+| `messages` | Role, text, provider-neutral block JSON, tool name/call id, stop reason, usage, user text, attachments, resume flag |
+| `tasks` | Original request, objective and revisions, plan and revision, criteria, status |
+| `runs` | Conversation, task, status, stop reason, error, iteration/tool counts, timestamps |
+| `tool_attempts` | Run, call id, canonical name, argument digest/JSON, effect, status, result digest, reconciliation note/time |
+| `mcp_servers` | Transport, URL/command/args/env, headers, enable/trust flags, timeouts |
+| `tools` | Namespaced name, schema, description, enable/approval, risk, effect, package digest |
+| `skills` | Name, description, path, enable/auto-include/hidden flags |
 | `secrets` | Name, ciphertext, description |
-| `settings` | Singleton row: global system prompt |
+| `settings` | Global system prompt and the Unlimited steps flag |
 
-`create_all` only creates missing tables, so `db.py` also runs an idempotent
-forward migration that inspects the schema and issues `ALTER TABLE ADD COLUMN`
-for columns introduced after a database was first created. That is how an
-existing `.local/toolloom.db` picks up new fields without data loss.
+`create_all` creates missing tables; an idempotent forward migration adds columns
+introduced after a database was first created, without losing data.
 
+## 14. Concurrency and lifecycle
 
-## 12. Durable execution and recovery
+Reservations are process-local:
 
-Four identities, deliberately distinct:
-
-- **Conversation** — what was said. The `messages` table.
-- **Task** — what is being accomplished: `original_request` (immutable), `objective`
-  and `plan` (each versioned), and `completion_criteria`.
-- **Run** — one attempt: status, stop reason, iteration and tool-call counts.
-- **Tool attempt** — one dispatch: the tool, a digest of its arguments, the effect
-  classification in force, and an outcome.
-
-The loop is still owned by the streaming request. These rows make each attempt
-*accountable*, not detached.
-
-**Recorded before dispatch.** An attempt is written as `pending`, moved to `running`
-at dispatch, and settled when the result is persisted, independently of the SSE
-stream. A process that dies in between leaves a row rather than a gap.
-
-**Recovered on boot.** A run left `running` becomes `interrupted`; an attempt left
-`pending` or `running` becomes `unknown`. On resume the model receives the previous
-run's status, the mutations already completed, and the outcomes that are uncertain,
-so it continues from evidence instead of being told to carry on.
-
-**No blind retries.** Re-dispatching an identical call whose outcome is `unknown` is
-refused unless the tool is `read_only`, with a message naming the uncertainty and
-suggesting a check first. Resolving it is an operator action
-(`POST /conversations/{id}/attempts/{id}/reconcile`), because the runtime cannot know
-whether the side effect landed.
-
-**Effect classification is ours, not theirs.** `tools.effect` is
-`read_only | idempotent | mutating | unknown`, defaults to `unknown`, and is
-operator-controllable. It is never inferred from an MCP server's own description: a
-server calling a tool read-only is stating an intent, not a guarantee. Our own reads
-are pre-classified because we wrote them; `shell`, `python` and generated
-capabilities stay `unknown`, which keeps them sequential and non-retryable.
-
-**Plan state is pinned.** `plan_read` and `plan_write` maintain the task. The
-rendered objective and plan go into the *system* prompt, outside the message-trimming
-path, so no amount of summarisation can remove them. `plan.md` in the workspace is a
-projection of the record, never a second authority.
-
-## 13. Context management
-
-`ContextPolicy` owns the whole fitting sequence and runs on every iteration. The
-order is chosen by cost:
-
-1. **Fit.** If the prompt fits, nothing happens. The provider's own
-   `usage.input_tokens` for the previous prompt is trusted for that prefix and only
-   messages appended since are estimated; the anchor is discarded when the system
-   prompt or the tool catalogue changes.
-2. **Prune tool results.** Old results are sliced to a head, a size note and a tail.
-   Deterministic, no model call. The assistant's `tool_use` blocks are untouched, so
-   the action history stays legible while its volume collapses.
-3. **Summarise.** Only when pruning is not enough. `ContextCompactor` uses the same
-   provider and keeps a verbatim recent suffix. A summary is accepted only on a
-   completed turn, so a truncated one cannot make the messages it covered disappear.
-4. **Drop the oldest exchanges.** The only step that truly loses information. A unit
-   is one exchange — an assistant message together with the results answering it — so
-   a run of a hundred tool calls is a hundred droppable units rather than one
-   indivisible turn. The newest exchange is never dropped; when trimming leaves the
-   transcript opening with an assistant message, an explicit note says earlier
-   messages were dropped.
-5. **Refuse.** If the system prompt, the tool schemas and the newest exchange alone
-   exceed the window, no lossless path exists, so the run fails with a clear,
-   recoverable error naming the budget. Silently truncating the operator's own
-   message would be worse.
-
-Repair and truncation are unchanged: `repair_orphan_tool_uses` never fabricates a
-success, and oversized output is bounded as described in section 7. There is no
-tokenizer dependency; estimates are approximate and the UI says so.
-
-## 14. Concurrency
-
-Run reservations are process-local: a set on the app state. The current
-check/add/remove paths contain no await and execute on the event loop; there is
-no separate lock around these transitions.
-
-- One active run per conversation. A second request returns `409`.
-- At most 16 active runs globally. Beyond that the request returns `429`.
+- One active run per conversation; a second request returns `409`.
+- At most 16 active runs globally; beyond that returns `429`.
 - Deleting a conversation with an active run returns `409`.
-- A cancelled or disconnected run releases its reservation, and the transcript
-  records the cancellation.
-- A run has a wall-clock deadline (300 seconds by default) and emits a resumable
-  stop reason if it is reached.
+- A cancelled or disconnected run releases its reservation and records the stop.
 
-One Uvicorn worker is the supported topology. The reservation set is in memory,
-so multiple workers would not share it.
+A run has a wall-clock deadline (`TOOLLOOM_RUN_TIMEOUT_SECONDS`, default 1800s).
+One Uvicorn worker is the supported topology; the reservation set is in memory,
+so multiple workers would not share it. On shutdown, MCP sessions are closed and
+the engine is disposed. Background title tasks hold a strong reference and are
+bounded by their own deadline.
 
-## 15. Security boundaries
+## 15. Frontend
+
+Plain HTML, CSS and JavaScript served by FastAPI. No framework, build step or
+runtime CDN; the bundled Geist font and local Markdown renderer work offline.
+
+The UI has a sessions rail, a conversation column and an on-demand details panel.
+Answers stream over `fetch` with an SSE reader. Intermediate commentary and tool
+calls are grouped into one activity disclosure per turn; the final answer stays
+separate. The details panel lists enabled tools grouped by server and the
+workspace files, with in-place disable and download actions.
+
+Browser preferences (theme, model, motion) are stored locally. Transcripts,
+usage, tool execution, workspace files and credentials remain backend-owned. The
+client polls the lightweight `/meta` endpoint for title updates rather than
+re-fetching the conversation.
+
+## 16. Security boundaries
 
 Enforced in code:
 
-- Loopback bind. `Host` is validated on every request, `Origin` on
-  state-changing requests, and CORS is not opened with a wildcard.
-- The provider key, vault key and MCP headers never reach the model, the
-  browser, a log line or a tool subprocess environment.
-- Secrets are encrypted at rest with Fernet. The key lives in a git-ignored file
-  with `0600` permissions, or in `TOOLLOOM_SECRETS_KEY`. The API returns a masked
-  preview and never the value.
-- Skill archives are validated before extraction: no absolute paths, no `..`,
-  no backslashes, no symlink entries, and a 25 MB expansion cap.
-- Generated capability packages are validated before installation: the manifest
-  must parse, the entrypoint and tests must resolve inside the package, and the
-  suite must run and pass. Installation copies the package outside the workspace
-  filesystem API, and every run re-hashes the entrypoint against the value
-  recorded at installation. That value is not yet bound to operator approval;
-  imports and manifest changes are not covered by execution integrity.
-- Tool output, uploaded files and skill bodies are data. The system prompt says
-  so, and inlined skill bodies have `</` neutralized so a skill cannot close its
-  own tags.
+- Loopback bind. `Host` is validated on every request and `Origin` on
+  state-changing requests; CORS is not opened with a wildcard.
+- Provider keys, the vault key and MCP credentials never reach the browser, the
+  model or a tool subprocess environment.
+- Secrets are Fernet-encrypted and returned only as masked previews.
+- Skill archives are validated before extraction and bounded in size.
+- Generated capability packages are validated, installed outside the workspace,
+  digest-checked, and approval-bound to the digest.
+- Tool output, uploaded files and skill bodies are treated as data. The system
+  prompt says so, and inlined skill bodies are tag-neutralized.
 
-Stated rather than papered over:
+Stated rather than implied:
 
 - **`python` is not a sandbox.** It runs with your privileges. Time and output
-  limits protect normal runs, not adversarial ones. Real isolation would need a
-  container or a separate user account, which this project does not provide.
-- **`shell` is not a sandbox either**, and confining it would be a lie rather than
-  a boundary: any command can `cd` anywhere, so the tool says plainly that it runs
-  with your privileges and leaves `cwd` unconfined. What it does provide is the
-  ability to verify work instead of asserting it, which is why it exists. Time and
-  output limits protect ordinary runs, not adversarial ones.
-- **A capability has the same limits, and no more.** Validation executes generated
-  tests and the installed tool executes generated code, both as your user. What
-  the runtime adds is review before installation, a hash check against later edits,
-  and the fact that nothing installs until an operator opts in.
-- **`http_fetch` resolves the hostname before connecting** rather than pinning
-  the validated address, so a DNS-rebinding race remains theoretically possible.
-- **`web_search` reads an undocumented DuckDuckGo HTML endpoint.** That is a
-  deliberate trade for keyless operation, and it can break when the markup
-  changes. Wikipedia and SearXNG are the supported alternatives.
+  limits protect normal runs, not adversarial ones.
+- **`shell` is not a sandbox either.** It runs as your user, and its `cwd` may
+  point outside the workspace. Confining the argument would be a false boundary;
+  the real controls are the opt-in flag, enablement and approval.
+- **A capability has the same limits.** Validation and execution run generated
+  code as your user. Review, digest binding and opt-in gates reduce risk; they do
+  not provide OS isolation.
+- **`http_fetch` resolves the hostname before connecting**, so a DNS-rebinding
+  race remains theoretically possible.
+- **`web_search` parses an undocumented DuckDuckGo HTML endpoint.** That is the
+  trade for keyless operation; Wikipedia and SearXNG are the alternatives.
 - Prompt formatting is defense in depth, not a security boundary. A model that
-  follows instructions found in a web page is a model-level problem, bounded here
-  by which tools are enabled and approved.
+  follows instructions embedded in tool output is bounded by which tools are
+  enabled and approved.
 
-## 16. Frontend
+## 17. Configuration
 
-Plain HTML, CSS and JavaScript served by FastAPI. No framework, no build step, no
-CDN at runtime: the Geist variable font is bundled with its licence.
-
-Three regions: a sessions rail, the conversation column, and a details panel that
-opens on demand. Answers stream over `fetch` with a reader loop that parses SSE
-frames; tool activity is grouped per turn and stays collapsed until opened, and
-the final answer remains separate from the commentary around it. Markdown is
-rendered by a small local module, and rendered text is escaped first.
-
-The details panel lists the enabled tools and the workspace files. Both sections
-are collapsed disclosures, and either can be acted on in place: a tool can be
-disabled from its row, and the whole workspace downloads as a zip rather than one
-file at a time. Tools are grouped by the server they came from — `sandbox`,
-`generated`, or one of your own connections — so the panel mirrors Settings → MCP
-and the origin of each capability is visible at a glance. The rail's workspace
-block doubles as the settings entry point, which is where operators expect to
-find it.
-
-Browser preferences (theme, model, motion) are stored locally. The motion switch
-forces reduced motion on top of the `prefers-reduced-motion` media query, which
-CSS already honours on its own; when nothing is stored the switch reflects the
-operating system's setting. Transcript, usage, tool execution, workspace files and
-credentials stay backend-owned.
-
-## 17. Testing
-
-The unit and integration suite runs offline: no key, no external network, no
-container.
-
-- Provider adapters are tested against scripted SSE chunks, including fragmented
-  tool-call JSON, malformed frames and interrupted streams.
-- MCP is tested against real local servers: a FastMCP instance over Streamable
-  HTTP, one over legacy SSE, and a child process over stdio.
-- The sandbox is tested for path traversal, symlink escape, malicious archives,
-  secret exposure, output spilling and the search parsers.
-- Tool Foundry is tested through the real `ToolExecutor`: scaffolding, the test
-  gate rejecting zero tests and failing tests, installation landing outside the
-  workspace, flag mapping, tamper detection, removal, and the reserved-name rules
-  for the `generated` server.
-- The loop is tested for tool round trips, refusal paths, duplicate call guards,
-  cancellation, orphan repair, compaction and resume.
-- API tests cover invalid input, missing ids, origin and host enforcement, and
-  the concurrency limits.
-- Frontend assets are checked statically, because there is no build step to catch
-  the mistakes that fail silently in a browser: every `var(--x)` in the stylesheet
-  must be defined, every element id the script reaches for must exist, every icon
-  name must have a path, the markup must be balanced, and the tab/panel wiring must
-  agree in both directions. Each of these was verified by mutation — reintroducing
-  the bug makes the corresponding check fail.
-
-Live checks that need a key, a browser or a paid call are opt-in and are not part
-of the default run. They use temporary databases, so they never touch your
-`.local/` data.
-
-## 18. Configuration
-
-Grouped by purpose. See `.env.example` for the full list.
+Environment-driven; `.env.example` is the complete reference.
 
 | Group | Variables |
 | --- | --- |
 | Provider | `LLM_PROVIDER`, `COMMANDCODE_API_KEY`, `COMMANDCODE_BASE_URL`, `COMMANDCODE_MODEL`, `COMMANDCODE_API_STYLE`, `COMMANDCODE_ZDR` |
 | Budgets | `MODEL_MAX_OUTPUT_TOKENS`, `MODEL_CONTEXT_WINDOW`, `TOOLLOOM_MAX_ITERATIONS`, `TOOLLOOM_MAX_OUTPUT_CONTINUATIONS`, `TOOLLOOM_MAX_TOOL_CALLS`, `TOOLLOOM_RUN_TIMEOUT_SECONDS` |
-| Server | `TOOLLOOM_HOST`, `TOOLLOOM_PORT`, `TOOLLOOM_DATA_DIR` |
+| Server/data | `TOOLLOOM_HOST`, `TOOLLOOM_PORT`, `TOOLLOOM_DATA_DIR`, `TOOLLOOM_DB_BUSY_TIMEOUT_SECONDS` |
 | Capabilities | `TOOLLOOM_ALLOW_STDIO`, `TOOLLOOM_ALLOW_PYTHON`, `TOOLLOOM_PYTHON_TIMEOUT_SECONDS`, `TOOLLOOM_PYTHON_OUTPUT_BYTES` |
 | Tool Foundry | `TOOLLOOM_ALLOW_FOUNDRY`, `TOOLLOOM_FOUNDRY_TIMEOUT_SECONDS`, `TOOLLOOM_FOUNDRY_TEST_TIMEOUT_SECONDS`, `TOOLLOOM_FOUNDRY_OUTPUT_BYTES` |
 | Shell | `TOOLLOOM_ALLOW_SHELL`, `TOOLLOOM_SHELL_TIMEOUT_SECONDS`, `TOOLLOOM_SHELL_OUTPUT_BYTES` |
 | Search | `TOOLLOOM_SEARCH_PROVIDER`, `TOOLLOOM_SEARCH_URL`, `TOOLLOOM_SEARCH_MAX_RESULTS`, `TOOLLOOM_SEARCH_TIMEOUT_SECONDS` |
 | Behaviour | `TOOLLOOM_AUTO_TITLES`, `TOOLLOOM_SEED_DEMO` |
 | Vault | `TOOLLOOM_SECRETS_KEY` |
-| Cost reporting | `TOOLLOOM_PRICE_INPUT_PER_1K`, `TOOLLOOM_PRICE_OUTPUT_PER_1K` |
+| Cost | `TOOLLOOM_PRICE_INPUT_PER_1K`, `TOOLLOOM_PRICE_OUTPUT_PER_1K` |
 
-Invalid enum values fail at startup. Cost figures appear only when you supply
-prices; token counts are always reported and no price is ever invented.
+Invalid enum values fail at startup. Incompatible context/output settings fail
+early with a precise error. Costs appear only when prices are configured; token
+counts are always reported and no price is invented.
+
+## 18. Testing
+
+The default suite is offline: no key, no external network and no container. It
+covers the agent loop, both provider wire formats, MCP over HTTP/SSE/stdio, the
+sandbox and workspace rules, Tool Foundry authoring and installation, skills,
+secrets, compaction, resume, concurrency limits and the SSE/API contract. It drives
+the real `ToolExecutor` for tool-use, refusal, cancellation and recovery paths, and
+checks the static UI assets without a build step.
+
+Live checks are opt-in and use temporary databases, so they never touch the
+operator's `.local/` data. The browser check requires Playwright:
+
+```bash
+TOOLLOOM_LIVE_SMOKE=1 uv run python tests/live_provider_smoke.py
+TOOLLOOM_LIVE_FOUNDRY=1 uv run python tests/live_foundry_smoke.py
+node tests/frontend_smoke.cjs
+```
 
 ## 19. Deliberate non-goals
 
-Each of these was considered and left out on purpose. They are not oversights.
-
-- **No agent framework.** LangChain, LangGraph and similar would take ownership
-  of the loop this project exists to own.
-- **No multi-user or hosted mode.** There is no authentication, so remote
-  exposure is out of scope until there is.
+- **No agent framework.** The loop is the product; LangChain/LangGraph would take
+  ownership of it.
+- **No multi-user or hosted mode.** There is no authentication; remote exposure is
+  out of scope until there is.
 - **No RAG or vector store.** Workspace files, `fs_grep` and web search cover the
   retrieval needs of a single-user local agent.
-- **No OS-level isolation for Python.** Claiming otherwise would be worse than
-  not shipping it. It is opt-in, with the limitation stated where you turn it on.
-- **No invented capabilities.** Models are listed from the provider catalogue,
-  costs only from configured prices, and evaluation numbers never come from a
-  simulated run.
+- **No OS isolation for Python, shell or generated capabilities.** The limitation
+  is stated at each opt-in rather than papered over.
+- **No invented data.** Models come from the provider catalogue, costs only from
+  configured prices, and a tool result is never fabricated.

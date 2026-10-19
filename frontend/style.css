@@ -190,6 +190,7 @@ kbd { font: 10px var(--ui); opacity: .8; margin-left: auto; }
 }
 .entry-status[data-state="ok"] { color: var(--pass); }
 .entry-status[data-state="error"] { color: var(--fail); }
+.entry-status[data-state="failed"] { color: var(--fail); }
 .entry-status[data-state="running"] { color: var(--signal); }
 .entry-caret { color: var(--ink-2); font-family: var(--data); font-size: var(--t-meta); }
 

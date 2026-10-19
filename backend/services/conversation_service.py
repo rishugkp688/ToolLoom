@@ -16,13 +16,18 @@ def title_from_message(text: str, limit: int = 60) -> str:
     return cleaned[: limit - 1].rstrip() + "…"
 
 
-def _summary(session, conversation) -> dict:
+def _summary(session, conversation, message_count: int | None = None) -> dict:
     return {
         "id": conversation.id,
         "title": conversation.title,
+        "title_source": conversation.title_source,
         "created_at": conversation.created_at,
         "updated_at": conversation.updated_at,
-        "message_count": MessageRepository(session).count(conversation.id),
+        "message_count": (
+            MessageRepository(session).count(conversation.id)
+            if message_count is None
+            else message_count
+        ),
     }
 
 
@@ -48,7 +53,16 @@ class ConversationService:
     def list(self) -> list[dict]:
         with self.db.session() as session:
             conversations = ConversationRepository(session).list()
-            return [_summary(session, c) for c in conversations]
+            counts = MessageRepository(session).counts_by_conversation()
+            return [_summary(session, c, counts.get(c.id, 0)) for c in conversations]
+
+    def meta(self, conversation_id: str) -> dict | None:
+        """Header metadata only: no transcript, so polling it stays cheap."""
+        with self.db.session() as session:
+            conversation = ConversationRepository(session).get(conversation_id)
+            if conversation is None:
+                return None
+            return _summary(session, conversation)
 
     def get(self, conversation_id: str) -> dict | None:
         with self.db.session() as session:

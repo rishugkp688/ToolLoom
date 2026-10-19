@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-from backend.services.sandbox.workspace import HIDDEN_DIRS, Workspace, WorkspaceError
+from backend.services.sandbox.workspace import (
+    HIDDEN_DIRS,
+    RUNTIME_DIR,
+    SKIP_TREE_DIRS,
+    Workspace,
+    WorkspaceError,
+)
+from backend.services.tool_errors import ToolPreflightError
+from backend.utils.fs import atomic_write_text
 
 MAX_UNPAGED_READ = 10 * 1024 * 1024
 MAX_PAGED_READ = 200 * 1024 * 1024
@@ -43,8 +52,17 @@ def read(workspace: Workspace, arguments: dict) -> str:
             raise WorkspaceError(f"file too large to page ({size} bytes)")
         if _is_binary(target):
             raise WorkspaceError("refusing to read a binary file")
-        start = max(0, int(offset or 1)) - 1
-        count = int(limit) if limit else 500
+        try:
+            offset_value = int(offset) if offset is not None else 1
+            limit_value = int(limit) if limit is not None else 500
+        except (TypeError, ValueError) as exc:
+            raise WorkspaceError("offset and limit must be integers") from exc
+        if offset_value < 1:
+            raise WorkspaceError("offset must be at least 1")
+        if limit_value < 1:
+            raise WorkspaceError("limit must be at least 1")
+        start = offset_value - 1
+        count = limit_value
         lines: list[str] = []
         with target.open("r", encoding="utf-8", errors="replace") as handle:
             for index, line in enumerate(handle):
@@ -66,7 +84,15 @@ def read(workspace: Workspace, arguments: dict) -> str:
     return text
 
 
-def write(workspace: Workspace, arguments: dict) -> str:
+def _is_runtime_owned(workspace: Workspace, target: Path) -> bool:
+    try:
+        relative = target.resolve().relative_to(workspace.root)
+    except ValueError:
+        return False
+    return RUNTIME_DIR in relative.parts
+
+
+def _prepare_write(workspace: Workspace, arguments: dict):
     target = workspace.resolve(arguments.get("path"))
     content = arguments.get("content")
     if content is None:
@@ -77,13 +103,46 @@ def write(workspace: Workspace, arguments: dict) -> str:
         raise WorkspaceError(f"refusing to write {len(encoded)} bytes (max {MAX_WRITE_BYTES})")
     if target == workspace.root or target.is_dir():
         raise WorkspaceError("cannot write to a directory")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if _is_runtime_owned(workspace, target):
+        raise WorkspaceError(
+            "this path is runtime-owned; update the task through sandbox__plan_write"
+        )
     mode = arguments.get("mode") or "write"
     if mode not in {"write", "append"}:
         raise WorkspaceError("`mode` must be 'write' or 'append'")
-    with target.open("a" if mode == "append" else "w", encoding="utf-8") as handle:
-        handle.write(data)
-    return f"wrote {len(encoded)} bytes to {workspace.relative(target)}"
+
+    expected = arguments.get("expected_sha256")
+    if expected is not None:
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+            raise WorkspaceError("`expected_sha256` must be a 64-character hex digest")
+        current = (
+            hashlib.sha256(target.read_bytes()).hexdigest()
+            if target.exists()
+            else hashlib.sha256(b"").hexdigest()
+        )
+        if current.lower() != expected.lower():
+            raise WorkspaceError(
+                "file changed since it was read; re-read it before writing "
+                f"(current sha256 {current})"
+            )
+
+    return target, data, encoded, mode
+
+
+def write(workspace: Workspace, arguments: dict) -> str:
+    try:
+        target, data, encoded, mode = _prepare_write(workspace, arguments)
+    except (WorkspaceError, ValueError, TypeError) as exc:
+        raise ToolPreflightError(str(exc)) from exc
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if mode == "append":
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+    else:
+        atomic_write_text(target, data)
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    return f"wrote {len(encoded)} bytes to {workspace.relative(target)} (sha256 {digest})"
 
 
 def list_dir(workspace: Workspace, arguments: dict) -> str:
@@ -92,7 +151,7 @@ def list_dir(workspace: Workspace, arguments: dict) -> str:
         raise WorkspaceError(f"{workspace.relative(target)} is not a directory")
     entries: list[tuple[str, bool]] = []
     for child in target.iterdir():
-        if child.name in HIDDEN_DIRS:
+        if child.name in HIDDEN_DIRS or child.name in SKIP_TREE_DIRS:
             continue
         if workspace.is_hidden(child):
             continue
@@ -140,14 +199,9 @@ def _grep(workspace: Workspace, arguments: dict) -> str:
         raise WorkspaceError(f"invalid regex: {exc}") from exc
 
     root = workspace.resolve(arguments.get("path") or ".")
-    if root.is_file():
-        files = [root]
-    else:
-        files = [
-            path
-            for path in sorted(root.rglob("*"))
-            if path.is_file() and not workspace.is_hidden(path)
-        ]
+    # Stream files instead of materialising and sorting the entire tree, and prune
+    # dependency/build directories the caller almost never wants to search.
+    files = [root] if root.is_file() else workspace.iter_files(root)
 
     matches: list[str] = []
     chars = 0
@@ -176,6 +230,8 @@ def delete(workspace: Workspace, arguments: dict) -> str:
     target = workspace.resolve(arguments.get("path"), must_exist=True)
     if target == workspace.root:
         raise WorkspaceError("refusing to delete the workspace root")
+    if _is_runtime_owned(workspace, target):
+        raise WorkspaceError("this path is runtime-owned and cannot be deleted")
     recursive = bool(arguments.get("recursive", False))
     if target.is_dir():
         if not recursive:

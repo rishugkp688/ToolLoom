@@ -41,6 +41,7 @@ class AttemptLedger:
         namespaced_name: str,
         arguments_digest: str,
         effect: str,
+        arguments: dict | None = None,
     ) -> str:
         """Persist the intent to dispatch, before dispatching."""
         with self.db.session() as session:
@@ -50,6 +51,7 @@ class AttemptLedger:
                 namespaced_name=namespaced_name,
                 arguments_digest=arguments_digest,
                 effect=effect,
+                arguments_json=json.dumps(arguments or {}, ensure_ascii=True),
             )
             return attempt.id
 
@@ -60,27 +62,58 @@ class AttemptLedger:
                 ToolAttemptRepository(session).set_status(attempt, RUNNING)
 
     def settle(
-        self, attempt_id: str, *, is_error: bool, output_text: str, uncertain: bool = False
+        self,
+        attempt_id: str,
+        *,
+        is_error: bool,
+        output_text: str,
+        uncertain: bool = False,
+        verification_failed: bool = False,
+        session=None,
     ) -> None:
         """Record the outcome independently of the SSE stream.
 
         ``uncertain`` marks a failure that happened after dispatch and cannot be
         proven ineffective: the attempt becomes ``unknown``, not ``failed``, so the
         retry guard refuses an identical repeat.
+
+        Passing ``session`` lets the caller settle and write the transcript entry in
+        one transaction, so a crash between the two cannot leave a settled attempt
+        with no recorded result.
         """
+        if session is not None:
+            self._settle_in(
+                session, attempt_id, is_error, output_text, uncertain, verification_failed
+            )
+            return
+        with self.db.session() as session:
+            self._settle_in(
+                session, attempt_id, is_error, output_text, uncertain, verification_failed
+            )
+
+    def _settle_in(
+        self,
+        session,
+        attempt_id: str,
+        is_error: bool,
+        output_text: str,
+        uncertain: bool,
+        verification_failed: bool,
+    ) -> None:
         from backend.models.tool_attempt import UNKNOWN
 
-        with self.db.session() as session:
-            repository = ToolAttemptRepository(session)
-            attempt = repository.get(attempt_id)
-            if attempt is None:
-                return
-            repository.set_status(
-                attempt,
-                UNKNOWN if uncertain else (FAILED if is_error else SUCCEEDED),
-                is_error=is_error,
-                result_digest=result_digest(output_text),
-            )
+        repository = ToolAttemptRepository(session)
+        attempt = repository.get(attempt_id)
+        if attempt is None:
+            return
+        # A command that ran and failed verification is a settled failure, not a
+        # completed change: resume must not tell the model to skip it.
+        repository.set_status(
+            attempt,
+            UNKNOWN if uncertain else (FAILED if (is_error or verification_failed) else SUCCEEDED),
+            is_error=is_error,
+            result_digest=result_digest(output_text),
+        )
 
     def reconcile_orphans(self) -> int:
         with self.db.session() as session:
@@ -102,14 +135,39 @@ class AttemptLedger:
                 "status": attempt.status,
             }
 
-    def mark_reconciled(self, attempt_id: str) -> bool:
+    def mark_reconciled(
+        self, attempt_id: str, note: str = "Operator checked the current state"
+    ) -> bool:
+        from backend.models.tool_attempt import UNCERTAIN
+        from backend.utils import utcnow
+
         with self.db.session() as session:
             repository = ToolAttemptRepository(session)
             attempt = repository.get(attempt_id)
-            if attempt is None:
+            if attempt is None or attempt.status not in UNCERTAIN:
                 return False
+            attempt.reconciliation_note = note
+            attempt.reconciled_at = utcnow()
             repository.set_status(attempt, RECONCILED)
             return True
+
+    def uncertain_details(self, conversation_id: str) -> list[dict]:
+        with self.db.session() as session:
+            return [
+                {
+                    "id": a.id,
+                    "run_id": a.run_id,
+                    "tool_call_id": a.tool_call_id,
+                    "tool": a.namespaced_name,
+                    "effect": a.effect,
+                    "status": a.status,
+                    "arguments": json.loads(a.arguments_json or "{}"),
+                    "arguments_digest": a.arguments_digest,
+                    "started_at": a.started_at,
+                    "ended_at": a.ended_at,
+                }
+                for a in ToolAttemptRepository(session).uncertain_for_conversation(conversation_id)
+            ]
 
     def describe_conversation(self, conversation_id: str) -> dict:
         """The evidence a resume needs: what finished, what is uncertain."""
@@ -118,11 +176,8 @@ class AttemptLedger:
             completed = repository.settled_mutating_for_conversation(conversation_id)
             uncertain = repository.uncertain_for_conversation(conversation_id)
             return {
-                "completed": [
-                    {"tool": a.namespaced_name, "effect": a.effect} for a in completed
-                ],
+                "completed": [{"tool": a.namespaced_name, "effect": a.effect} for a in completed],
                 "uncertain": [
-                    {"id": a.id, "tool": a.namespaced_name, "status": a.status}
-                    for a in uncertain
+                    {"id": a.id, "tool": a.namespaced_name, "status": a.status} for a in uncertain
                 ],
             }

@@ -269,6 +269,7 @@ class ToolRegistry:
                 self._validate(values)
                 if any(k != "enabled" and v != getattr(server, k) for k, v in fields.items()):
                     self._revoke(session, server_id)
+                    self.connection_manager.invalidate_server_soon(server_id)
             return repo.update(server, **fields)
 
     def delete_server(self, server_id: str) -> bool:
@@ -277,13 +278,28 @@ class ToolRegistry:
             server = repo.get(server_id)
             if server and server.name in reserved_server_names():
                 raise RegistryError("runtime-owned servers can be disabled, not removed")
-            return repo.delete(server_id)
+            deleted = repo.delete(server_id)
+            if deleted:
+                self.connection_manager.invalidate_server_soon(server_id)
+            return deleted
 
     # -- tools ----------------------------------------------------------------
 
     def list_tools(self, server_id: str) -> list[Any]:
         with self.db.session() as session:
             return ToolRepository(session).list_by_server(server_id)
+
+    def tool_state(self, namespaced_name: str) -> dict[str, Any] | None:
+        """The current enable/approval/risk state, after any reconciliation."""
+        with self.db.session() as session:
+            row = ToolRepository(session).get_by_namespaced(namespaced_name)
+            if row is None:
+                return None
+            return {
+                "enabled": bool(row.enabled),
+                "approved": bool(row.approved),
+                "risk": row.risk,
+            }
 
     def set_tool_enabled(self, server_id: str, tool_name: str, enabled: bool):
         return self.update_tool(server_id, tool_name, enabled=enabled)
@@ -429,6 +445,7 @@ class ToolRegistry:
                     if changed:
                         self._revoke(session, existing.id)
                         existing.enabled = False
+                        self.connection_manager.invalidate_server_soon(existing.id)
                     server = repo.update(existing, **fields)
                     # Repository patch ignores None; import must clear removed fields.
                     for k in ("url", "command", "cwd"):
@@ -442,5 +459,6 @@ class ToolRegistry:
                         and server.transport not in _IN_PROCESS_TRANSPORTS
                     ):
                         repo.delete(server.id)
+                        self.connection_manager.invalidate_server_soon(server.id)
                         removed += 1
         return {"results": results, "applied": True, "removed": removed}

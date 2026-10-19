@@ -25,6 +25,7 @@ from pathlib import Path
 
 from backend.services.mcp_client import ToolCallOutcome
 from backend.services.sandbox._exec import find_posix_shell, minimal_env, run_argv
+from backend.services.tool_errors import ToolPreflightError
 
 MAX_COMMAND_CHARS = 8_000
 
@@ -49,47 +50,56 @@ def _working_directory(arguments: dict, default: Path) -> Path:
     if not candidate.is_absolute():
         candidate = default / candidate
     if not candidate.is_dir():
-        raise ValueError(f"working directory not found: {requested}")
+        raise ToolPreflightError(f"working directory not found: {requested}")
     return candidate
 
 
 async def execute(arguments, context, settings) -> ToolCallOutcome:
     if not settings.toolloom_allow_shell:
-        raise RuntimeError("Shell execution is disabled; set TOOLLOOM_ALLOW_SHELL=1 and restart")
+        raise ToolPreflightError("Shell is disabled; set TOOLLOOM_ALLOW_SHELL=1 and restart")
 
     command = arguments.get("command", "")
     if not isinstance(command, str) or not command.strip():
-        raise ValueError("command must be a non-empty string")
+        raise ToolPreflightError("command must be a non-empty string")
     if len(command) > MAX_COMMAND_CHARS:
-        raise ValueError(f"command must be at most {MAX_COMMAND_CHARS} characters")
+        raise ToolPreflightError(f"command must be at most {MAX_COMMAND_CHARS} characters")
 
     shell = find_posix_shell()
     if shell is None:
-        raise RuntimeError(
+        raise ToolPreflightError(
             "no POSIX shell found on PATH; shell execution needs bash or sh "
             "(on Windows, install Git Bash or use WSL)"
         )
 
     cwd = _working_directory(arguments, Path(context.workspace().root))
     env = minimal_env({"HOME": os.environ["HOME"]} if "HOME" in os.environ else None)
+    timeout = _timeout(arguments, settings.toolloom_shell_timeout_seconds)
     result = await run_argv(
         [*shell, command],
         cwd=str(cwd),
         env=env,
-        timeout=_timeout(arguments, settings.toolloom_shell_timeout_seconds),
+        timeout=timeout,
         max_bytes=settings.toolloom_shell_output_bytes,
     )
+    timed_out = result.stop_reason == "timeout"
+    payload = {
+        "command": command,
+        "cwd": str(cwd),
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exit_code": result.exit_code,
+        "stop_reason": result.stop_reason,
+        "truncated": result.truncated,
+    }
+    if timed_out:
+        payload["note"] = f"stopped after {timeout}s; output above is partial"
+    # A failing test run, or `grep` finding nothing, exits non-zero and is still the
+    # answer the caller asked for. Reporting it as a tool error made ordinary
+    # debugging look like harness breakage. The exit code carries that information.
     return ToolCallOutcome(
-        text=json.dumps(
-            {
-                "command": command,
-                "cwd": str(cwd),
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "exit_code": result.exit_code,
-                "stop_reason": result.stop_reason,
-                "truncated": result.truncated,
-            }
-        ),
-        is_error=not result.ok,
+        text=json.dumps(payload),
+        is_error=timed_out,
+        outcome_uncertain=timed_out,
+        exit_code=result.exit_code,
+        verification_failed=(not timed_out and result.exit_code not in (None, 0)),
     )

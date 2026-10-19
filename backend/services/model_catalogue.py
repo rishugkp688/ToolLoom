@@ -12,6 +12,9 @@ FALLBACK_CONTEXT_WINDOW = 32_768  # a local budget, never advertised as model me
 # Ceiling for the derived output allowance. Half the window leaves the other half for
 # the prompt, which is generous for an agent that writes files but still bounded.
 ADAPTIVE_OUTPUT_CEILING = 32_768
+# An accepted configuration must leave room for a minimal prompt. An output cap is
+# an upper bound, not a requirement to reserve it all when the prompt is smaller.
+MIN_INPUT_TOKENS = 512
 
 
 @dataclass(frozen=True)
@@ -42,10 +45,17 @@ def budget_for(settings, info: ModelInfo | None = None) -> ModelBudget:
     # take half the window, up to a ceiling. A fixed number cannot be right for both
     # a reasoning model that spends its budget thinking and a model that answers
     # directly, and guessing one is what made a normal turn stop with no output.
+    headroom = max(64, window // 20)
+    # Allocate jointly: the output cap cannot consume the prompt's minimum, and a
+    # small window cannot give all of itself to one side.
+    max_output = max(1, window - headroom - MIN_INPUT_TOKENS)
+    balanced_output = max(1, window // 2)
     if settings.model_max_output_tokens:
-        output = min(settings.model_max_output_tokens, max(1, window - 64))
+        output = min(
+            settings.model_max_output_tokens, max_output, balanced_output
+        )
     else:
-        output = min(ADAPTIVE_OUTPUT_CEILING, max(1, window // 2))
+        output = min(ADAPTIVE_OUTPUT_CEILING, balanced_output, max_output)
     return ModelBudget(window, output, source)
 
 

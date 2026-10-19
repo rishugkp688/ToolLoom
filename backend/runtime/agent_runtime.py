@@ -44,7 +44,8 @@ from backend.services.providers.base import (
     UsageEvent,
     blocks_to_dicts,
 )
-from backend.services.task_service import TaskService
+from backend.services.task_service import MAX_BLOCK_CHARS, TaskService
+from backend.utils.async_work import run_blocking
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +81,6 @@ class AgentRuntime:
         # Configurable, not a constant: how many times a truncated turn may be
         # continued is a deployment choice, like every other budget here.
         max_continuations = max(0, settings.toolloom_max_output_continuations)
-        with self.db.session() as session:
-            unlimited = SettingRepository(session).get().unlimited_tools
 
         controller = StepController()
         total_usage = Usage()
@@ -97,23 +96,17 @@ class AgentRuntime:
         continuation_text = ""
         continuations = 0
         advisory: str | None = None
-        with self.db.session() as session:
-            repo = MessageRepository(session)
-            seen_call_ids = {
-                block.get("id")
-                for row in repo.list_by_conversation(conversation_id)
-                for block in repo.blocks(row)
-                if block.get("type") == "tool_use"
-            }
-
-        # The task is what this run is for; the run is one attempt at it. Both are
-        # durable, so a stop of any kind leaves a record a resume can read.
-        task = self.tasks.ensure(conversation_id, request=self._first_request(conversation_id))
-        with self.db.session() as session:
-            run_id = RunRepository(session).start(conversation_id, task_id=task.id).id
+        run_id = None
+        start_state = {}
         outcome = {"status": INTERRUPTED, "stop_reason": None, "error": "the run did not finish"}
+        # Once a terminal outcome has been chosen (done or error), closing the
+        # generator afterwards must not rewrite it as interrupted.
+        terminal_committed = False
 
         try:
+            unlimited, seen_call_ids, run_id = await run_blocking(
+                self._start_run, conversation_id, start_state
+            )
             from backend.services.model_catalogue import budget_for
 
             budget = (
@@ -124,7 +117,7 @@ class AgentRuntime:
             policy = ContextPolicy(self.db, settings, self.compactor)
             anchor: UsageAnchor | None = None
 
-            advisory = self._resume_advisory(conversation_id)
+            advisory = await run_blocking(self._resume_advisory, conversation_id)
 
             while True:
                 iteration += 1
@@ -132,7 +125,7 @@ class AgentRuntime:
                 # objective or plan mid-run, and the next provider request must see it.
                 # A changed block also changes the system digest, which invalidates the
                 # token anchor automatically.
-                pinned = self._pinned_state(conversation_id)
+                pinned = await run_blocking(self._pinned_state, conversation_id, budget)
                 if not unlimited and iteration > max_iterations:
                     finish_reason = finish_reason or "max_iterations"
                 if finish_reason:
@@ -185,7 +178,13 @@ class AgentRuntime:
                         "stop_reason": "error",
                         "error": "provider returned no result",
                     }
-                    self._persist_note(conversation_id, "[provider returned no result]", "error")
+                    terminal_committed = True
+                    await run_blocking(
+                        self._persist_note,
+                        conversation_id,
+                        "[provider returned no result]",
+                        "error",
+                    )
                     yield AgentEvent(ERROR, {"message": "provider returned no result"})
                     return
 
@@ -198,8 +197,12 @@ class AgentRuntime:
                         "stop_reason": "error",
                         "error": "provider reused a tool-call ID",
                     }
-                    self._persist_note(
-                        conversation_id, "[stopped: duplicate tool-call ID]", "error"
+                    terminal_committed = True
+                    await run_blocking(
+                        self._persist_note,
+                        conversation_id,
+                        "[stopped: duplicate tool-call ID]",
+                        "error",
                     )
                     yield AgentEvent(
                         ERROR,
@@ -207,9 +210,10 @@ class AgentRuntime:
                     )
                     return
                 seen_call_ids.update(call_ids)
+                await run_blocking(self._canonicalize_calls, turn)
                 if finish_reason and not turn.tool_calls:
                     turn.stop_reason = finish_reason
-                self._persist_assistant(conversation_id, turn)
+                await run_blocking(self._persist_assistant, conversation_id, turn)
                 partial_text = ""
                 total_usage.input_tokens += turn.usage.input_tokens
                 total_usage.output_tokens += turn.usage.output_tokens
@@ -220,6 +224,8 @@ class AgentRuntime:
                         built.messages, built.system, built.tools, turn.usage.input_tokens
                     )
                 stop_reason = turn.stop_reason
+                if stop_reason == "tool_use" and not turn.tool_calls:
+                    raise ValueError("provider returned tool_use without any tool calls")
                 if turn.text:
                     controller.note_text()
                     if stop_reason == "max_tokens":
@@ -227,9 +233,7 @@ class AgentRuntime:
                         # reply here would make each slice overwrite the previous one.
                         continuation_text += turn.text
                     else:
-                        reply = (
-                            continuation_text + turn.text if continuation_text else turn.text
-                        )
+                        reply = continuation_text + turn.text if continuation_text else turn.text
                         continuation_text = ""
                 if stop_reason == "error":
                     outcome = {
@@ -237,6 +241,7 @@ class AgentRuntime:
                         "stop_reason": "error",
                         "error": "provider stream ended without a complete response",
                     }
+                    terminal_committed = True
                     yield AgentEvent(
                         ERROR,
                         {
@@ -248,6 +253,79 @@ class AgentRuntime:
                     )
                     return
 
+                if (
+                    not turn.text
+                    and not turn.tool_calls
+                    and turn.stop_reason not in {"tool_use", "max_tokens"}
+                    and not finish_reason
+                ):
+                    # An empty completed turn must not become a successful empty
+                    # answer. A continuation that ended with nothing still has the
+                    # text accumulated from its earlier slices. A contentless
+                    # max_tokens turn is handled below as a budget problem.
+                    if continuation_text:
+                        reply = continuation_text
+                        continuation_text = ""
+                    elif not reply:
+                        outcome = {
+                            "status": FAILED,
+                            "stop_reason": "empty_response",
+                            "error": "provider returned an empty completed turn",
+                        }
+                        terminal_committed = True
+                        await run_blocking(
+                            self._persist_note,
+                            conversation_id,
+                            "[provider returned an empty completed turn]",
+                            "empty_response",
+                        )
+                        yield AgentEvent(
+                            ERROR,
+                            {
+                                "message": (
+                                    "The provider returned an empty completed response. "
+                                    "Retry, raise the output budget, or switch models."
+                                )
+                            },
+                        )
+                        return
+
+                if (
+                    turn.tool_calls
+                    and turn.stop_reason not in {"tool_use", "max_tokens"}
+                    and not finish_reason
+                ):
+                    # A provider that ends the turn while emitting calls has given an
+                    # inconsistent contract. Refuse them explicitly rather than saving
+                    # orphaned calls or pretending the turn completed normally.
+                    for call in turn.tool_calls:
+                        result = to_result(
+                            call,
+                            "The provider ended the turn before this call could be "
+                            "completed, so it was not executed. Re-issue it if still needed.",
+                            is_error=True,
+                        )
+                        await run_blocking(self._persist_tool_result, conversation_id, result)
+                        tool_trace.append(_trace(result))
+                        yield AgentEvent(TOOL_CALL_END, _end_payload(result, iteration))
+                    await run_blocking(
+                        self._persist_note,
+                        conversation_id,
+                        "[stopped: inconsistent tool-use stop reason]",
+                        "error",
+                    )
+                    outcome = {
+                        "status": FAILED,
+                        "stop_reason": "error",
+                        "error": "provider ended a tool-use turn without a tool-use stop",
+                    }
+                    terminal_committed = True
+                    yield AgentEvent(
+                        ERROR,
+                        {"message": "The provider ended a tool-use turn inconsistently."},
+                    )
+                    return
+
                 if finish_reason:
                     # A provider may ignore the empty tool catalogue. Never execute those calls.
                     for call in turn.tool_calls:
@@ -256,13 +334,16 @@ class AgentRuntime:
                             "Tool execution stopped; this call was not executed.",
                             is_error=True,
                         )
-                        self._persist_tool_result(conversation_id, result)
+                        await run_blocking(self._persist_tool_result, conversation_id, result)
                         tool_trace.append(_trace(result))
                         yield AgentEvent(TOOL_CALL_END, _end_payload(result, iteration))
                     stop_reason = finish_reason
                     if turn.tool_calls:
-                        self._persist_note(
-                            conversation_id, "[stopped: tool execution limit]", stop_reason
+                        await run_blocking(
+                            self._persist_note,
+                            conversation_id,
+                            "[stopped: tool execution limit]",
+                            stop_reason,
                         )
                     break
                 if stop_reason == "max_tokens":
@@ -279,7 +360,7 @@ class AgentRuntime:
                             "example by writing a file in parts.",
                             is_error=True,
                         )
-                        self._persist_tool_result(conversation_id, result)
+                        await run_blocking(self._persist_tool_result, conversation_id, result)
                         tool_trace.append(_trace(result))
                         yield AgentEvent(TOOL_CALL_END, _end_payload(result, iteration))
 
@@ -295,7 +376,8 @@ class AgentRuntime:
                                 "answer. Raise MODEL_MAX_OUTPUT_TOKENS in .env, or choose a "
                                 "model that spends less of that budget on reasoning."
                             )
-                        self._persist_note(
+                        await run_blocking(
+                            self._persist_note,
                             conversation_id,
                             "[stopped: output limit reached before any content]",
                             "max_tokens",
@@ -305,7 +387,8 @@ class AgentRuntime:
                     if continuations > max_continuations:
                         reply = continuation_text or reply
                         finish_reason = "max_tokens"
-                        self._persist_note(
+                        await run_blocking(
+                            self._persist_note,
                             conversation_id,
                             "[stopped: output limit reached repeatedly]",
                             "max_tokens",
@@ -330,16 +413,22 @@ class AgentRuntime:
                     for note in controller.note_call(call.name, call.arguments or {}):
                         yield AgentEvent(STEP_NOTE, _note_payload(note))
 
+                    before_revision = await run_blocking(self._call_revision, conversation_id, call)
                     refused = False
                     if exhausted or finish_reason:
-                        finish_reason = finish_reason or "max_iterations"
+                        finish_reason = finish_reason or "max_tool_calls"
                         refused = True
                         result = to_result(
                             call,
                             "Tool execution stopped; this call was not executed.",
                             is_error=True,
                         )
-                    elif controller.should_refuse(call.name, call.arguments or {}):
+                    elif controller.should_refuse(
+                        call.name,
+                        call.arguments or {},
+                        progress_unknown=before_revision is None
+                        or before_revision.startswith("partial:"),
+                    ):
                         refused = True
                         # Refuse this call, not the run. A repeated read is often a
                         # symptom of context reduction rather than a loop, and ending
@@ -365,17 +454,27 @@ class AgentRuntime:
                             },
                         )
 
-                    self._persist_tool_result(conversation_id, result)
+                    if not result.persisted:
+                        await run_blocking(self._persist_tool_result, conversation_id, result)
                     tool_trace.append(_trace(result))
                     yield AgentEvent(TOOL_CALL_END, _end_payload(result, iteration))
 
-                    # A successful mutating call is progress: repeating an earlier call
-                    # (same test command after an edit) is no longer a duplicate.
-                    changed = (
-                        not result.is_error
-                        and self.tool_executor is not None
-                        and self.tool_executor.effect_of(call.name) == "mutating"
+                    # Progress is what makes repeating a verification command
+                    # legitimate. Judge it from the workspace, so a shell edit counts
+                    # even though the tool's effect classification is `unknown`.
+                    effect = (
+                        await run_blocking(self.tool_executor.effect_of, call.name)
+                        if self.tool_executor is not None
+                        else "unknown"
                     )
+                    changed = not result.is_error and effect == "mutating"
+                    if not result.is_error and effect != "read_only":
+                        current_revision = await run_blocking(
+                            self._call_revision, conversation_id, call
+                        )
+                        if current_revision is not None:
+                            if before_revision is not None and current_revision != before_revision:
+                                changed = True
                     note = controller.note_result(
                         call.name,
                         result.is_error,
@@ -388,10 +487,11 @@ class AgentRuntime:
 
                 advisory = controller.advice()
                 if not unlimited and tool_calls_made >= max_tool_calls:
-                    finish_reason = finish_reason or "max_iterations"
+                    finish_reason = finish_reason or "max_tool_calls"
 
-            self._touch(conversation_id)
+            await run_blocking(self._touch, conversation_id)
             outcome = {"status": COMPLETED, "stop_reason": stop_reason, "error": None}
+            terminal_committed = True
             yield AgentEvent(
                 DONE,
                 {
@@ -405,24 +505,95 @@ class AgentRuntime:
         except GeneratorExit:
             # Closing the generator (client disconnect, loop shutdown) takes neither of
             # the branches below, so the partial answer and a stop marker were lost.
-            outcome = {"status": INTERRUPTED, "stop_reason": "cancelled", "error": None}
-            self._record_failure(conversation_id, partial_text, "cancelled")
+            # A close *after* a terminal outcome has been committed is not a
+            # cancellation: the run already completed.
+            if not terminal_committed:
+                outcome = {"status": INTERRUPTED, "stop_reason": "cancelled", "error": None}
+                await run_blocking(self._record_failure, conversation_id, partial_text, "cancelled")
             raise
         except asyncio.CancelledError:
-            outcome = {"status": CANCELLED, "stop_reason": "cancelled", "error": None}
-            self._record_failure(conversation_id, partial_text, "cancelled")
+            if not terminal_committed:
+                outcome = {"status": CANCELLED, "stop_reason": "cancelled", "error": None}
+                await run_blocking(self._record_failure, conversation_id, partial_text, "cancelled")
             raise
         except Exception as exc:  # never leak a raw traceback to the stream
-            message = f"{type(exc).__name__}: {exc}"
-            if self.tool_executor is not None:
-                message = self.tool_executor._redact(message)
-            outcome = {"status": FAILED, "stop_reason": "error", "error": type(exc).__name__}
-            self._record_failure(conversation_id, partial_text, "error")
-            yield AgentEvent(ERROR, {"message": message})
+            if terminal_committed:
+                logger.error("Run failed after a terminal outcome (%s)", type(exc).__name__)
+            else:
+                message = f"{type(exc).__name__}: {exc}"
+                if self.tool_executor is not None:
+                    message = self.tool_executor._redact(message)
+                outcome = {
+                    "status": FAILED,
+                    "stop_reason": "error",
+                    "error": type(exc).__name__,
+                }
+                terminal_committed = True
+                await run_blocking(self._record_failure, conversation_id, partial_text, "error")
+                yield AgentEvent(ERROR, {"message": message})
         finally:
             # Whatever happened — done, error, cancellation or the client vanishing —
             # the attempt is closed durably. This is what a resume reads.
-            self._finish_run(run_id, outcome, iteration, tool_calls_made, conversation_id)
+            settled_id = run_id or start_state.get("run_id")
+            if settled_id:
+                await run_blocking(
+                    self._finish_run,
+                    settled_id,
+                    outcome,
+                    iteration,
+                    tool_calls_made,
+                    conversation_id,
+                )
+
+    def _start_run(self, conversation_id: str, state=None):
+        with self.db.session() as session:
+            unlimited = SettingRepository(session).get().unlimited_tools
+            repo = MessageRepository(session)
+            seen = {
+                block.get("id")
+                for row in repo.list_by_conversation(conversation_id)
+                for block in repo.blocks(row)
+                if block.get("type") == "tool_use"
+            }
+            previous = RunRepository(session).last_settled(conversation_id)
+            latest = repo.latest_user(conversation_id, include_resume=True)
+            resume_id = previous.id if previous and latest and latest.is_resume else None
+        task = self.tasks.ensure(conversation_id, request=self._current_request(conversation_id))
+        with self.db.session() as session:
+            run_id = (
+                RunRepository(session)
+                .start(conversation_id, task_id=task.id, resumed_from=resume_id)
+                .id
+            )
+        if state is not None:
+            state["run_id"] = run_id
+        return unlimited, seen, run_id
+
+    def _settle_result(self, attempt_id, conversation_id, result):
+        with self.db.session() as session:
+            self.ledger.settle(
+                attempt_id,
+                is_error=result.is_error,
+                output_text=result.model_text,
+                uncertain=result.outcome_uncertain,
+                verification_failed=result.verification_failed,
+                session=session,
+            )
+            self._add_tool_result(session, conversation_id, result)
+
+    def _call_revision(self, conversation_id, call):
+        from pathlib import Path
+
+        from backend.services.sandbox.shell_tool import _working_directory
+        from backend.services.sandbox.workspace import Workspace, workspace_for
+
+        try:
+            root = workspace_for(self.settings.workspaces_dir, conversation_id).root
+            if call.name == "sandbox__shell":
+                root = _working_directory(call.arguments or {}, Path(root))
+            return Workspace(root).revision()
+        except Exception:
+            return None
 
     def _record_failure(self, conversation_id: str, partial_text: str, reason: str) -> None:
         # Saving the failure must never mask cancellation or the original exception.
@@ -444,11 +615,30 @@ class AgentRuntime:
             return model_id
         return self.settings.commandcode_model
 
+    def _canonicalize_calls(self, turn) -> None:
+        """Resolve every requested name once, before it is persisted or measured.
+
+        A bare `fs_write` and the canonical `sandbox__fs_write` are the same
+        operation. If the persisted block, loop fingerprint and ledger keep the
+        requested spelling while dispatch resolves it, an uncertain outcome becomes
+        invisible to the next identical call.
+        """
+        if self.tool_executor is None:
+            return
+        for call in turn.tool_calls:
+            canonical = self.tool_executor.resolve_tool_name(call.name)
+            if canonical and canonical != call.name:
+                call.name = canonical
+
     async def _execute(
         self, call: ToolCallBlock, conversation_id: str, run_id: str | None = None
     ) -> ExecutionResult:
         if self.tool_executor is None:
             return to_result(call, "Tools are not available in this build.", is_error=True)
+
+        canonical = await run_blocking(self.tool_executor.resolve_tool_name, call.name)
+        if canonical:
+            call.name = canonical
 
         parse_error = getattr(call, "parse_error", None)
         if parse_error:
@@ -463,19 +653,21 @@ class AgentRuntime:
             )
 
         digest = arguments_digest(call.arguments or {})
-        effect = self.tool_executor.effect_of(call.name)
+        effect = await run_blocking(self.tool_executor.effect_of, call.name)
 
         # An earlier identical call whose outcome is unknown must not be repeated
         # blind: the side effect may already have landed. Checked before the ledger is
         # written, so the ledger only ever records dispatches that were attempted.
         if run_id is not None and effect != "read_only":
-            prior = self.ledger.uncertain_match(conversation_id, call.name, digest)
+            prior = await run_blocking(
+                self.ledger.uncertain_match, conversation_id, call.name, digest
+            )
             if prior is not None:
                 return to_result(
                     call,
                     f"(refused) An earlier call to `{call.name}` with identical arguments "
-                    f"has an unknown outcome ({prior['status']}): the process stopped before "
-                    "its result was recorded, so the effect may or may not have happened. "
+                    f"has an unknown outcome ({prior['status']}, attempt {prior['id']}): "
+                    "the effect may or may not have happened. "
                     "Check the current state with a read-only tool first, then decide — do "
                     "not repeat it blindly.",
                     is_error=True,
@@ -485,42 +677,81 @@ class AgentRuntime:
         if run_id is not None:
             # Written before dispatch, so a crash leaves evidence that something was
             # attempted rather than a silent gap.
-            attempt_id = self.ledger.begin(
+            attempt_id = await run_blocking(
+                self.ledger.begin,
                 run_id,
                 tool_call_id=call.id,
                 namespaced_name=call.name,
                 arguments_digest=digest,
                 effect=effect,
+                arguments=await run_blocking(
+                    self.tool_executor._redact_arguments, call.arguments or {}
+                ),
             )
-            self.ledger.dispatched(attempt_id)
+            await run_blocking(self.ledger.dispatched, attempt_id)
 
         result = await self.tool_executor.execute(call, conversation_id)
+        result.attempt_id = attempt_id
 
         if attempt_id is not None:
-            # Recorded independently of the SSE stream, so the outcome survives a
-            # client that vanished mid-flight.
-            self.ledger.settle(
-                attempt_id,
-                is_error=result.is_error,
-                output_text=result.model_text,
-                uncertain=result.outcome_uncertain,
-            )
+            # Settlement and the transcript entry share one transaction. Recorded
+            # independently of the SSE stream so the outcome survives a client that
+            # vanished mid-flight — and atomically, so a crash between the two cannot
+            # leave an attempt settled with no result on record.
+            await run_blocking(self._settle_result, attempt_id, conversation_id, result)
+            result.persisted = True
         return result
 
-    def _first_request(self, conversation_id: str) -> str:
-        """The user's opening request, for the task's immutable original_request."""
-        with self.db.session() as session:
-            for row in MessageRepository(session).list_by_conversation(conversation_id):
-                text = (row.user_text or row.content or "").strip()
-                if row.role == "user" and text:
-                    return text[:2000]
-        return ""
+    def _workspace_revision(self, conversation_id: str) -> str | None:
+        try:
+            from backend.services.sandbox.workspace import workspace_for
 
-    def _pinned_state(self, conversation_id: str) -> str:
-        """Task objective, plan and execution state, for the system prompt."""
+            return workspace_for(self.settings.workspaces_dir, conversation_id).revision()
+        except Exception:
+            return None
+
+    def _current_request(self, conversation_id: str) -> str:
+        """The request that started *this* run, not the first one ever.
+
+        After a task is completed, the next run must create its task from the message
+        the user just sent. Reusing the conversation's opening message made task B's
+        objective silently remain task A's.
+        """
+        with self.db.session() as session:
+            row = MessageRepository(session).latest_user(conversation_id)
+        if row is not None:
+            text = (row.user_text or row.content or "").strip()
+            if text:
+                return text
+        return self._first_request(conversation_id)
+
+    def _first_request(self, conversation_id: str) -> str:
+        """The user's opening request, used only when a run has no trigger of its own.
+
+        Stored in full. The old 2,000-character cut silently dropped the tail of a
+        long specification, and the task then held a goal that was not what was
+        asked for.
+        """
+        with self.db.session() as session:
+            row = MessageRepository(session).first_user(conversation_id)
+        return (row.user_text or row.content or "").strip() if row is not None else ""
+
+    def _pinned_state(self, conversation_id: str, budget=None) -> str:
+        """Task objective, plan and execution state, for the system prompt.
+
+        The view is scaled to the resolved input budget: a fixed 4,000-character
+        block is still too large for a small model, and an unbounded plan used to
+        make the next prompt impossible to build.
+        """
+        limit = MAX_BLOCK_CHARS
+        if budget is not None:
+            limit = min(MAX_BLOCK_CHARS, max(600, int(budget.input_tokens)))
+        execution = self.tasks.render_execution_block(
+            conversation_id, self.ledger, max_chars=limit // 3
+        )
         blocks = [
-            self.tasks.render_task_block(conversation_id),
-            self.tasks.render_execution_block(conversation_id, self.ledger),
+            self.tasks.render_task_block(conversation_id, max_chars=limit - len(execution) - 2),
+            execution,
         ]
         return "\n\n".join(block for block in blocks if block)
 
@@ -554,7 +785,7 @@ class AgentRuntime:
         from backend.services.sandbox.workspace import workspace_for
 
         with self.db.session() as session:
-            rows = MessageRepository(session).list_by_conversation(conversation_id)
+            rows = MessageRepository(session).list_tail(conversation_id, max_chars=20_000)
         if not rows or rows[-1].role != "user" or not rows[-1].is_resume:
             return None
 
@@ -587,11 +818,11 @@ class AgentRuntime:
             lines.append("Recent tool calls: " + ", ".join(str(name) for name in recent_tools))
         try:
             workspace = workspace_for(self.settings.workspaces_dir, conversation_id)
-            files = [
-                workspace.relative(path)
-                for path in sorted(workspace.root.rglob("*"))
-                if path.is_file() and not workspace.is_hidden(path)
-            ][:20]
+            files = []
+            for path in workspace.iter_files():
+                files.append(workspace.relative(path))
+                if len(files) >= 20:
+                    break
         except Exception:
             files = []
         if files:
@@ -617,21 +848,28 @@ class AgentRuntime:
                 repo.touch(conversation)
 
     def _persist_tool_result(self, conversation_id: str, result: ExecutionResult) -> None:
+        with self.db.session() as session:
+            self._add_tool_result(session, conversation_id, result)
+
+    def _add_tool_result(self, session, conversation_id: str, result: ExecutionResult) -> None:
         block = ToolResultBlock(
             tool_call_id=result.tool_call_id,
             content=result.model_text,
             is_error=result.is_error,
             name=result.name,
+            exit_code=result.exit_code,
+            verification_failed=result.verification_failed,
+            outcome_uncertain=result.outcome_uncertain,
+            attempt_id=result.attempt_id,
         )
-        with self.db.session() as session:
-            MessageRepository(session).add(
-                conversation_id=conversation_id,
-                role="tool",
-                content=result.model_text,
-                blocks=blocks_to_dicts([block]),
-                tool_name=result.name,
-                tool_call_id=result.tool_call_id,
-            )
+        MessageRepository(session).add(
+            conversation_id=conversation_id,
+            role="tool",
+            content=result.model_text,
+            blocks=blocks_to_dicts([block]),
+            tool_name=result.name,
+            tool_call_id=result.tool_call_id,
+        )
 
     def _persist_note(
         self, conversation_id: str, text: str, stop_reason: str | None = None
@@ -666,6 +904,10 @@ def _trace(result: ExecutionResult) -> dict:
         "output_text": result.output_text,
         "attempts": result.attempts,
         "duration_ms": result.duration_ms,
+        "exit_code": result.exit_code,
+        "verification_failed": result.verification_failed,
+        "outcome_uncertain": result.outcome_uncertain,
+        "attempt_id": result.attempt_id,
     }
 
 

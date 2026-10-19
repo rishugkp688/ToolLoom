@@ -43,6 +43,9 @@ class FoundryManifest(BaseModel):
     version: str = "1.0.0"
     description: str
     runtime: Literal["python"] = "python"
+    # Existing installed CLIs keep their flag contract. New scaffolds use an
+    # exact JSON envelope so empty collections/null/booleans are not lossy.
+    argument_encoding: Literal["flags", "json"] = "flags"
     # Relative to the package root, must stay inside it, must be a .py file.
     entrypoint: str
     input_schema: dict[str, Any] = Field(alias="inputSchema")

@@ -7,12 +7,14 @@ frontend.
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -99,7 +101,16 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
     settings.validate_runtime()
     settings.ensure_dirs()
 
-    db = Database(settings.database_url)
+    # A child process can outlive an abrupt backend death. Reconcile recorded jobs
+    # before any new work starts, verifying process identity rather than trusting a
+    # possibly reused PID alone.
+    from backend.services.sandbox import jobs as job_registry
+
+    job_registry.configure(settings.data_dir / "jobs")
+
+    db = Database(
+        settings.database_url, busy_timeout_seconds=settings.toolloom_db_busy_timeout_seconds
+    )
     db.create_all()
 
     @asynccontextmanager
@@ -107,9 +118,32 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
         try:
             yield
         finally:
+            manager = getattr(_app.state, "mcp_connection_manager", None)
+            if manager is not None:
+                try:
+                    await manager.aclose()
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "Could not close MCP sessions (%s)", type(exc).__name__
+                    )
             db.dispose()
 
     app = FastAPI(title="ToolLoom", version=settings.version, lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(_request: Request, exc: RequestValidationError):
+        from backend.schemas.safe import safe_text
+
+        detail = [
+            {
+                "loc": [safe_text(part) for part in error.get("loc", ())],
+                "msg": safe_text(error.get("msg", "invalid value")),
+                "type": safe_text(error.get("type", "value_error")),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": detail})
+
     app.state.settings = settings
     app.state.db = db
     app.state.active_runs = set()
@@ -175,6 +209,11 @@ def create_app(settings: Settings | None = None, provider=None) -> FastAPI:
             return JSONResponse(status_code=413, content={"detail": "request body too large"})
         try:
             return await call_next(request)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "request body is not valid UTF-8 JSON"},
+            )
         except Exception as exc:
             # Avoid logging arbitrary exception strings, which may contain credentials.
             logging.getLogger(__name__).error("Request failed (%s)", type(exc).__name__)

@@ -14,16 +14,17 @@ import sys
 
 from backend.services.mcp_client import ToolCallOutcome
 from backend.services.sandbox._exec import minimal_env, run_argv
+from backend.services.tool_errors import ToolPreflightError
 
 MAX_CODE_CHARS = 32_000
 
 
 async def execute(arguments, context, settings) -> ToolCallOutcome:
     if not settings.toolloom_allow_python:
-        raise RuntimeError("Python is disabled; set TOOLLOOM_ALLOW_PYTHON=1 and restart")
+        raise ToolPreflightError("Python is disabled; set TOOLLOOM_ALLOW_PYTHON=1 and restart")
     code = arguments.get("code", "")
     if not isinstance(code, str) or not code.strip() or len(code) > MAX_CODE_CHARS:
-        raise ValueError(f"code must contain 1–{MAX_CODE_CHARS} characters")
+        raise ToolPreflightError(f"code must contain 1–{MAX_CODE_CHARS} characters")
     timeout = min(
         arguments.get("timeout_seconds", settings.toolloom_python_timeout_seconds),
         settings.toolloom_python_timeout_seconds,
@@ -35,15 +36,24 @@ async def execute(arguments, context, settings) -> ToolCallOutcome:
         timeout=timeout,
         max_bytes=settings.toolloom_python_output_bytes,
     )
+    payload = {
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exit_code": result.exit_code,
+        "stop_reason": result.stop_reason,
+        "truncated": result.truncated,
+    }
+    timed_out = result.stop_reason == "timeout"
+    if timed_out:
+        payload["note"] = (
+            f"stopped after {timeout}s; output above is partial"
+        )
+    # A non-zero exit is a result, not a broken call: `sys.exit(7)` and a failing
+    # assertion both mean the code ran. Only a timeout is a failure to execute.
     return ToolCallOutcome(
-        text=json.dumps(
-            {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "exit_code": result.exit_code,
-                "stop_reason": result.stop_reason,
-                "truncated": result.truncated,
-            }
-        ),
-        is_error=not result.ok,
+        text=json.dumps(payload),
+        is_error=timed_out,
+        outcome_uncertain=timed_out,
+        exit_code=result.exit_code,
+        verification_failed=(not timed_out and result.exit_code not in (None, 0)),
     )

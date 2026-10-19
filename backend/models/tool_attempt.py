@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.db import Base
@@ -53,6 +53,9 @@ class ToolAttempt(Base):
     # sha256 of the canonical arguments, so an identical repeat is recognisable
     # without storing the arguments twice.
     arguments_digest: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    arguments_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    reconciliation_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # read_only | mutating | unknown, as it was when this attempt was made.
     effect: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default=PENDING)

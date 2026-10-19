@@ -18,8 +18,10 @@ import asyncio
 import os
 import shutil
 import signal
+import sys
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 
 # Kept deliberately small. HOME is excluded so a tool cannot quietly write into
 # the operator's home directory by expanding a path. Callers that genuinely need
@@ -101,6 +103,40 @@ async def terminate(process) -> None:
     await asyncio.wait_for(process.communicate(), 5)
 
 
+class _Retained:
+    """A bounded view of one stream: its head and its tail, never only its head.
+
+    A long stdout preamble used to consume the whole allowance, so the final error
+    on stderr was discarded. Each stream now has its own budget and keeps both ends.
+    """
+
+    def __init__(self, cap: int) -> None:
+        self.cap = max(1, cap)
+        self.head_cap = self.cap // 2
+        self.tail_cap = self.cap - self.head_cap
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+
+    def feed(self, data: bytes) -> None:
+        self.total += len(data)
+        if len(self.head) < self.head_cap:
+            take = min(len(data), self.head_cap - len(self.head))
+            self.head.extend(data[:take])
+            data = data[take:]
+        if data and self.tail_cap:
+            self.tail.extend(data)
+            if len(self.tail) > self.tail_cap:
+                del self.tail[: len(self.tail) - self.tail_cap]
+
+    @property
+    def truncated(self) -> bool:
+        return self.total > self.cap
+
+    def text(self) -> str:
+        return bytes(self.head + self.tail).decode("utf-8", "replace")
+
+
 async def run_argv(
     argv: list[str],
     *,
@@ -110,8 +146,16 @@ async def run_argv(
     max_bytes: int,
 ) -> ExecResult:
     """Run a command, bounded by wall clock and combined output size."""
+    owned_argv = argv
+    if sys.platform == "linux":
+        owned_argv = [
+            sys.executable,
+            "-I",
+            str(Path(__file__).with_name("process_guardian.py")),
+            *argv,
+        ]
     process = await asyncio.create_subprocess_exec(
-        *argv,
+        *owned_argv,
         cwd=cwd,
         env=env,
         stdin=asyncio.subprocess.DEVNULL,
@@ -119,22 +163,24 @@ async def run_argv(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=os.name == "posix",
     )
-    stdout, stderr = bytearray(), bytearray()
-    total = 0
-    truncated = False
+    stdout_cap = max(1, int(max_bytes * 0.75))
+    stderr_cap = max(1, max_bytes - stdout_cap)
+    stdout, stderr = _Retained(stdout_cap), _Retained(stderr_cap)
     reason: str | None = None
 
-    async def read(stream, sink: bytearray) -> None:
-        nonlocal total, truncated
+    job_registry = None
+    job = None
+    try:
+        from backend.services.sandbox import jobs as job_registry
+
+        job = job_registry.register(process.pid, argv, cwd)
+    except Exception:
+        job_registry = None
+        job = None
+
+    async def read(stream, sink: _Retained) -> None:
         while chunk := await stream.read(4096):
-            remaining = max(0, max_bytes - total)
-            if remaining:
-                sink.extend(chunk[:remaining])
-            total += len(chunk)
-            if total > max_bytes:
-                # Keep draining so the child never blocks on a full pipe, but stop
-                # retaining. The wall-clock timeout, not the log size, is the bound.
-                truncated = True
+            sink.feed(chunk)
 
     tasks = [
         asyncio.create_task(read(process.stdout, stdout)),
@@ -154,10 +200,12 @@ async def run_argv(
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await terminate(process)
+            if job_registry is not None:
+                job_registry.unregister(job)
     return ExecResult(
-        stdout=stdout.decode("utf-8", "replace"),
-        stderr=stderr.decode("utf-8", "replace"),
+        stdout=stdout.text(),
+        stderr=stderr.text(),
         exit_code=process.returncode,
         stop_reason=reason or "exited",
-        truncated=truncated,
+        truncated=stdout.truncated or stderr.truncated,
     )
