@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
+
+
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 class HealthResponse(BaseModel):
@@ -30,6 +36,10 @@ class ConversationSummary(BaseModel):
     updated_at: datetime
     message_count: int = 0
 
+    @field_serializer("created_at", "updated_at", when_used="json")
+    def _serialize_timestamps(self, value: datetime) -> str:
+        return _utc_iso(value)
+
 
 class MessageOut(BaseModel):
     id: str
@@ -44,6 +54,10 @@ class MessageOut(BaseModel):
     stop_reason: str | None = None
     usage_input: int = 0
     usage_output: int = 0
+
+    @field_serializer("created_at", when_used="json")
+    def _serialize_created_at(self, value: datetime) -> str:
+        return _utc_iso(value)
 
 
 class ConversationDetail(ConversationSummary):

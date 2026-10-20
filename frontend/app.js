@@ -123,9 +123,18 @@ function escapeHtml(text) {
   );
 }
 
+function parseTimestamp(value) {
+  if (!value) return new Date();
+  const text = String(value);
+  // The backend stores naive UTC. An ISO timestamp without a zone is parsed as
+  // local by Date, so make the UTC intent explicit before formatting.
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+  const parsed = new Date(hasZone ? text : `${text}Z`);
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
 function timeOf(iso) {
-  const d = iso ? new Date(iso) : new Date();
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return parseTimestamp(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function setState(next) {
