@@ -211,6 +211,7 @@ async function openSession(id) {
   state.messages = [];
   state.historyBefore = null;
   state.attachableRunId = null;
+  logFollow = true;
   $("attachRunBtn").hidden = true;
   state.attachments = [];
   setContinue(false);
@@ -221,7 +222,7 @@ async function openSession(id) {
     if (state.currentId !== id) return;
     state.messages = detail.messages;
     state.historyBefore = detail.next_before;
-    restoreStopState(detail.messages);
+    restoreReadout(detail.messages);
     $("sessionTitle").textContent = detail.title || "Untitled session";
     renderLog();
     await refreshActiveRun(id);
@@ -375,6 +376,43 @@ function isErrorResult(result) {
   return Boolean(block && block.is_error);
 }
 
+const MAX_ENTRY_CHARS = 12_000;
+
+function truncateEntry(text, limit = MAX_ENTRY_CHARS) {
+  const value = String(text ?? "");
+  return value.length <= limit
+    ? value
+    : `${value.slice(0, limit)}\n…[preview truncated; ${value.length - limit} characters omitted]`;
+}
+
+function toolInputSummary(name, input) {
+  const tool = String(name || "").split("__").pop();
+  const arg = input || {};
+  if (tool === "fs_write") {
+    return `path: ${arg.path || "?"} · mode: ${arg.mode || "write"} · ${String(arg.content ?? "").length} chars`;
+  }
+  if (tool === "fs_edit") {
+    return `path: ${arg.path || "?"} · ${String(arg.old_text ?? "").length} → ${String(arg.new_text ?? "").length} chars`;
+  }
+  if (tool === "fs_read") {
+    return `path: ${arg.path || "?"} · offset: ${arg.offset ?? 1} · limit: ${arg.limit ?? 500} · column: ${arg.column ?? 1}`;
+  }
+  if (tool === "fs_list") return `path: ${arg.path || "."}`;
+  if (tool === "fs_grep") return `pattern: ${arg.pattern || "?"} · path: ${arg.path || "."}`;
+  if (tool === "fs_delete") return `path: ${arg.path || "?"}${arg.recursive ? " · recursive" : ""}`;
+  if (tool === "repo_instructions") return `path: ${arg.path || "."}`;
+  if (tool === "shell") return `cwd: ${arg.cwd || "workspace"} · timeout: ${arg.timeout_seconds ?? "default"}s`;
+  if (tool === "python") return `${String(arg.code ?? "").length} chars of Python`;
+  if (tool === "http_fetch") return `${String(arg.method || "GET").toUpperCase()} ${arg.url || "?"}`;
+  if (tool === "web_search") return `query: ${JSON.stringify(arg.query || "")} · max_results: ${arg.max_results ?? "default"}`;
+  if (tool === "plan_write") {
+    const steps = Array.isArray(arg.plan) ? arg.plan.length : null;
+    return [arg.status && `status: ${arg.status}`, steps !== null && `plan: ${steps} step(s)`]
+      .filter(Boolean).join(" · ") || null;
+  }
+  return null;
+}
+
 function entryElement(data) {
   const status = data.state;
   const glyph =
@@ -394,11 +432,15 @@ function entryElement(data) {
   const body = document.createElement("div");
   body.className = "entry-body";
   body.inert = true;
+  const summary = toolInputSummary(data.name, data.input);
+  const inputText = truncateEntry(JSON.stringify(data.input || {}, null, 2));
+  const outputText = truncateEntry(data.output || "(waiting for the backend)");
   body.innerHTML = `<div><div class="entry-pad">
+    ${summary ? `<div class="entry-summary">${escapeHtml(summary)}</div>` : ""}
     <div class="entry-key">input</div>
-    <pre class="entry-pre">${escapeHtml(JSON.stringify(data.input || {}, null, 2))}</pre>
+    <pre class="entry-pre">${escapeHtml(inputText)}</pre>
     <div class="entry-key">output</div>
-    <pre class="entry-pre">${escapeHtml(data.output || "(waiting for the backend)")}</pre>
+    <pre class="entry-pre">${escapeHtml(outputText)}</pre>
   </div></div>`;
 
   head.addEventListener("click", () => {
@@ -587,25 +629,43 @@ async function loadEarlierMessages() {
   finally { state.historyLoading = false; }
 }
 
+let logFollow = true;
+
+function atLogBottom(log) {
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+}
+
 function scrollLog() {
   const log = $("log");
-  log.scrollTop = log.scrollHeight;
+  if (!log) return;
+  if (logFollow || atLogBottom(log)) log.scrollTop = log.scrollHeight;
 }
 
 // --- streaming ---------------------------------------------------------------
 
 function parseSSE(buffer, onEvent) {
-  let idx;
-  while ((idx = buffer.indexOf("\n\n")) !== -1) {
-    const chunk = buffer.slice(0, idx);
-    buffer = buffer.slice(idx + 2);
-    let event = "message";
-    let data = "";
-    for (const line of chunk.split("\n")) {
-      if (line.startsWith("event:")) event = line.slice(6).trim();
-      else if (line.startsWith("data:")) data += line.slice(5).trim();
+  const boundary = (text) => {
+    let found = null;
+    for (const separator of ["\r\n\r\n", "\n\n", "\r\r"]) {
+      const index = text.indexOf(separator);
+      if (index !== -1 && (!found || index < found.index)) {
+        found = { index, length: separator.length };
+      }
     }
-    onEvent(event, data);
+    return found;
+  };
+  let match;
+  while ((match = boundary(buffer))) {
+    const chunk = buffer.slice(0, match.index);
+    buffer = buffer.slice(match.index + match.length);
+    let event = "message";
+    const data = [];
+    for (const line of chunk.split(/\r\n|\n|\r/)) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+      // id:, retry: and comment lines do not change the model-facing payload.
+    }
+    if (data.length) onEvent(event, data.join("\n"));
   }
   return buffer;
 }
@@ -631,6 +691,7 @@ async function streamRun(url, payload, { userText = null, attachments = [], atta
   setState("running");
 
   if (userText !== null) {
+    logFollow = true;
     state.messages.push({
       role: "user",
       content: userText,
@@ -670,9 +731,23 @@ async function streamRun(url, payload, { userText = null, attachments = [], atta
   let iterationHasTools = false;
   let textBody = document.createElement("div");
   body.appendChild(textBody);
-  const paint = () => {
+  let paintTimer = null;
+  let lastPaint = 0;
+  const drawText = () => {
+    paintTimer = null;
+    lastPaint = performance.now();
+    if (!textBody.isConnected) return;
     textBody.innerHTML = renderMarkdown(text);
     scrollLog();
+  };
+  const paint = () => {
+    if (paintTimer) return;
+    const wait = Math.max(0, 50 - (performance.now() - lastPaint));
+    paintTimer = setTimeout(drawText, wait);
+  };
+  const flushPaint = () => {
+    if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
+    drawText();
   };
 
   const handle = (event, raw) => {
@@ -732,6 +807,7 @@ async function streamRun(url, payload, { userText = null, attachments = [], atta
       announce("Earlier turns were compacted into a summary.");
     } else if (event === "done") {
       terminal = true;
+      flushPaint();
       activity.summary.textContent = `Tool activity · ${liveToolCount} ${liveToolCount === 1 ? "call" : "calls"}`;
       updateReadout(data);
       state.lastStop = data.stop_reason;
@@ -743,6 +819,7 @@ async function streamRun(url, payload, { userText = null, attachments = [], atta
     } else if (event === "error") {
       terminal = true;
       streamFailed = true;
+      flushPaint();
       setContinue(true);
       setState("error");
       toast(data.message || "Run failed", "error");
@@ -802,6 +879,7 @@ async function streamRun(url, payload, { userText = null, attachments = [], atta
       toast(err.message, "error");
     }
   } finally {
+    if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
     state.running = false;
     state.controller = null;
     state.currentRunId = null;
@@ -878,7 +956,7 @@ async function refreshSession(id) {
       if (state.currentId === id) {
         state.messages = detail.messages;
         state.historyBefore = detail.next_before;
-        restoreStopState(detail.messages);
+        restoreReadout(detail.messages);
         $("sessionTitle").textContent = detail.title || "Untitled session";
         renderLog();
         await refreshActiveRun(id);
@@ -933,11 +1011,31 @@ const RESUMABLE_STOPS = new Set([
 
 function restoreStopState(messages) {
   const last = messages.at(-1);
-  if (!last?.stop_reason) return;
-  state.lastStop = last.stop_reason;
-  $("readStop").textContent = last.stop_reason;
+  state.lastStop = last?.stop_reason || null;
+  if (!state.lastStop) {
+    setContinue(false);
+    return;
+  }
+  $("readStop").textContent = state.lastStop;
   $("readStop").classList.remove("muted");
-  setContinue(RESUMABLE_STOPS.has(last.stop_reason));
+  setContinue(RESUMABLE_STOPS.has(state.lastStop));
+}
+
+function restoreReadout(messages, run = null) {
+  const last = messages.at(-1);
+  const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+  const stop = run?.stop_reason || last?.stop_reason || null;
+  updateReadout({
+    stop_reason: stop,
+    iterations: run?.iterations ?? 0,
+    tool_call_count: run?.tool_calls ?? 0,
+    usage: {
+      input_tokens: lastAssistant?.usage_input ?? 0,
+      output_tokens: lastAssistant?.usage_output ?? 0,
+    },
+  });
+  state.lastStop = stop;
+  setContinue(Boolean(stop && RESUMABLE_STOPS.has(stop)));
 }
 
 // --- composer ----------------------------------------------------------------
@@ -972,6 +1070,10 @@ async function uploadFiles(fileList) {
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
     toast(body.detail || "Upload failed", "error");
+    return;
+  }
+  if (state.currentId !== id) {
+    announce("Upload finished for the session that was open when it started.");
     return;
   }
   state.attachments.push(...body.files);
@@ -1020,7 +1122,8 @@ function updateReadout(done) {
   $("readIters").textContent = done.iterations ?? 0;
   $("readIn").textContent = usage.input_tokens ?? 0;
   $("readOut").textContent = usage.output_tokens ?? 0;
-  $("readTools").textContent = (done.tool_calls || []).length;
+  $("readTools").textContent = Array.isArray(done.tool_calls)
+    ? done.tool_calls.length : (done.tool_call_count ?? 0);
 }
 
 function groupByServer(tools) {
@@ -1034,10 +1137,11 @@ function groupByServer(tools) {
 }
 
 async function renderTask() {
+  const id = state.currentId;
   const host = $("taskList");
   const revision = $("taskRevision");
   revision.textContent = "";
-  if (!state.currentId) {
+  if (!id) {
     host.innerHTML = '<p class="hint">No session open.</p>';
     return;
   }
@@ -1046,14 +1150,17 @@ async function renderTask() {
   let runs = [];
   try {
     [task, runs] = await Promise.all([
-      api(`/conversations/${encodeURIComponent(state.currentId)}/task`).then((r) => r.task),
-      api(`/conversations/${encodeURIComponent(state.currentId)}/runs`).then((r) => r.runs || []),
+      api(`/conversations/${encodeURIComponent(id)}/task`).then((r) => r.task),
+      api(`/conversations/${encodeURIComponent(id)}/runs`).then((r) => r.runs || []),
     ]);
   } catch (_) {
+    if (state.currentId !== id) return;
     clearLoading(host);
     host.innerHTML = '<p class="hint">Task state unavailable.</p>';
     return;
   }
+  if (state.currentId !== id) return;
+  if (!state.running) restoreReadout(state.messages, runs[0]);
   clearLoading(host);
   host.innerHTML = "";
   if (!task) {
@@ -1105,8 +1212,10 @@ async function renderTask() {
 }
 
 async function refreshInspector() {
+  const id = state.currentId;
   await renderTask();
   await renderUncertainAttempts();
+  if (state.currentId !== id) return;
   const toolHost = $("toolList");
   if (state.toolsDirty || !state.toolCache) {
     showLoading(toolHost, "Reading registry…");
@@ -1178,14 +1287,15 @@ async function refreshInspector() {
   }
 
   const fileHost = $("fileList");
-  if (!state.currentId) {
+  if (!id) {
     fileHost.innerHTML = '<p class="hint">No session open.</p>';
     $("downloadAllBtn").hidden = true;
     return;
   }
   showLoading(fileHost, "Reading workspace…");
   try {
-    const listing = await api(`/conversations/${state.currentId}/workspace`);
+    const listing = await api(`/conversations/${id}/workspace`);
+    if (state.currentId !== id) return;
     clearLoading(fileHost);
     fileHost.innerHTML = "";
     $("downloadAllBtn").hidden = !listing.files.length;
@@ -1196,7 +1306,7 @@ async function refreshInspector() {
         const row = document.createElement("div");
         row.className = "file-item";
         const link = document.createElement("a");
-        link.href = `/conversations/${state.currentId}/workspace/download?path=${encodeURIComponent(file.path)}`;
+        link.href = `/conversations/${id}/workspace/download?path=${encodeURIComponent(file.path)}`;
         link.textContent = file.path;
         const size = document.createElement("span");
         size.className = "size num";
@@ -1206,6 +1316,7 @@ async function refreshInspector() {
       }
     }
   } catch (_) {
+    if (state.currentId !== id) return;
     clearLoading(fileHost);
     $("downloadAllBtn").hidden = true;
     fileHost.innerHTML = '<p class="hint">Workspace unavailable.</p>';
@@ -2029,6 +2140,9 @@ function applyTheme(theme) {
 }
 
 function wire() {
+  $("log").addEventListener("scroll", () => {
+    logFollow = atLogBottom($("log"));
+  }, { passive: true });
   document.querySelectorAll("[data-icon]").forEach((el) => { el.innerHTML = icon(el.dataset.icon); });
   document.querySelectorAll("[data-settings-tab]").forEach((button) => {
     button.addEventListener("click", () => {

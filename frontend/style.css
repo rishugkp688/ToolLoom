@@ -206,6 +206,10 @@ kbd { font: 10px var(--ui); opacity: .8; margin-left: auto; }
   font-family: var(--data); font-size: var(--t-meta); text-transform: uppercase;
   letter-spacing: 0.06em; color: var(--ink-2);
 }
+.entry-summary {
+  font-family: var(--data); font-size: var(--t-sm); color: var(--ink);
+  overflow-wrap: anywhere;
+}
 .entry-pre {
   margin: 0; padding: var(--s3); max-height: 320px; overflow: auto;
   background: var(--sunken); border: 1px solid var(--rule); border-radius: var(--r1);

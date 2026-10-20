@@ -88,6 +88,8 @@ class ConversationService:
                     "tool_call_id": row.tool_call_id,
                     "created_at": row.created_at,
                     "stop_reason": row.stop_reason,
+                    "usage_input": row.usage_input,
+                    "usage_output": row.usage_output,
                     **_presentation(row),
                 }
                 for row in rows

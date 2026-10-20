@@ -42,6 +42,8 @@ class MessageOut(BaseModel):
     tool_call_id: str | None = None
     created_at: datetime
     stop_reason: str | None = None
+    usage_input: int = 0
+    usage_output: int = 0
 
 
 class ConversationDetail(ConversationSummary):
